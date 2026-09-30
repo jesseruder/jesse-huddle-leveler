@@ -143,6 +143,42 @@ final class LevelerDSPTests: XCTestCase {
         XCTAssertGreaterThan(peak, 0.02)
     }
 
+    func testLiveSettingsTakeEffectOnNextBuffer() {
+        let s = leveler_create()!
+        defer { leveler_destroy(s) }
+        var p = leveler_default_params()
+        leveler_init(s, p, rate)
+        func run(_ seconds: Float) -> Float {
+            let n = Int(rate * seconds)
+            var buf = [Float](repeating: 0, count: n * 2)
+            for i in 0..<n { let v = 0.02 * sinf(2 * .pi * 220 * Float(i) / rate); buf[2 * i] = v; buf[2 * i + 1] = v }
+            buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, UInt32(n), 2) }
+            let tail = buf[n..<(2 * n)]
+            return 10 * log10f(tail.reduce(0) { $0 + $1 * $1 } / Float(tail.count))
+        }
+        let before = run(8)
+        p.level_ratio = 1  // leveling off
+        leveler_set_params(s, p)
+        let after = run(2)
+        XCTAssertGreaterThan(before - after, 5, "turning leveling off should drop the boost")
+    }
+
+    func testRepairToggleKeepsTheSameDelay() {
+        func impulseAt(declip: Int32) -> Int {
+            var p = leveler_default_params()
+            p.declip = declip
+            p.level_ratio = 1
+            let s = leveler_create()!
+            defer { leveler_destroy(s) }
+            leveler_init(s, p, rate)
+            var buf = [Float](repeating: 0, count: 2048)
+            buf[200] = 0.5; buf[201] = 0.5
+            buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, 1024, 2) }
+            return buf.firstIndex(where: { abs($0) > 0.1 })! / 2
+        }
+        XCTAssertEqual(impulseAt(declip: 1), impulseAt(declip: 0))
+    }
+
     func testCeilingHolds() {
         let s = leveler_create()!
         defer { leveler_destroy(s) }

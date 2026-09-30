@@ -47,8 +47,8 @@ void leveler_destroy(leveler_state *s);
 // Resets all state for a new stream. Keeps the bypass setting.
 void leveler_init(leveler_state *s, leveler_params p, float sample_rate);
 // Changes settings on a running stream without resetting its state. Safe to
-// call while the audio thread is processing: the worst case is one buffer
-// with a mix of old and new values.
+// call from one other thread while the audio thread is processing; the
+// change takes effect at the start of the next buffer.
 void leveler_set_params(leveler_state *s, leveler_params p);
 void leveler_set_bypass(leveler_state *s, int bypass);
 int leveler_get_bypass(leveler_state *s);
@@ -56,8 +56,10 @@ int leveler_get_bypass(leveler_state *s);
 leveler_meters leveler_take_meters(leveler_state *s);
 
 // Records the next `frames` stereo frames of input and output into caller-
-// owned interleaved buffers (2 * frames floats each), for diagnosis. The
-// buffers must outlive the recording; leveler_init stops it.
+// owned interleaved buffers (2 * frames floats each), for diagnosis. Passing
+// 0 frames stops recording, but the audio thread may still be writing to the
+// old buffers until its current callback ends: free them only once the
+// IOProc is stopped. leveler_init also stops it.
 void leveler_record(leveler_state *s, float *in_buf, float *out_buf, unsigned frames);
 unsigned leveler_recorded_frames(leveler_state *s);
 

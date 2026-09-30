@@ -31,7 +31,10 @@ typedef struct {
 } limiter;
 
 struct leveler_state {
-    leveler_params p;
+    leveler_params p;      // in use by the audio thread
+    leveler_params pending;  // written by leveler_set_params, guarded by pending_seq
+    atomic_uint pending_seq;  // odd while pending is being written
+    unsigned applied_seq;
     declipper dc;
     limiter lim;
     float sample_rate;
@@ -151,7 +154,27 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     atomic_store(&s->meter_level_db, -120.0f);
 }
 
-void leveler_set_params(leveler_state *s, leveler_params p) { apply_params(s, p); }
+// Settings reach the audio thread through a sequence lock: the writer makes
+// the sequence odd while it copies, and the audio thread takes the copy at
+// the start of a buffer only if the sequence was even and unchanged across
+// its read, so it never runs on a half-written set.
+void leveler_set_params(leveler_state *s, leveler_params p) {
+    unsigned seq = atomic_load_explicit(&s->pending_seq, memory_order_relaxed);
+    atomic_store_explicit(&s->pending_seq, seq + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    s->pending = p;
+    atomic_store_explicit(&s->pending_seq, seq + 2, memory_order_release);
+}
+
+static void take_pending_params(leveler_state *s) {
+    unsigned seq = atomic_load_explicit(&s->pending_seq, memory_order_acquire);
+    if (seq == s->applied_seq || (seq & 1)) return;
+    leveler_params p = s->pending;
+    atomic_thread_fence(memory_order_acquire);
+    if (atomic_load_explicit(&s->pending_seq, memory_order_relaxed) != seq) return;  // try next buffer
+    apply_params(s, p);
+    s->applied_seq = seq;
+}
 
 // Downward compression plus makeup for a signal at level_db.
 static float downward_gain_db(const leveler_params *p, float level_db) {
@@ -209,7 +232,7 @@ static void declip_fix(declipper *d, int c, unsigned a, unsigned b) {
 
 // Pushes one sample of channel c and returns the sample DECLIP_DELAY behind.
 // Call for channel 0 and 1, then advance d->w.
-static inline float declip_push(declipper *d, int c, float x) {
+static inline float declip_push(declipper *d, int c, float x, int repair) {
     unsigned w = d->w;
     d->ring[c][w % DECLIP_RING] = x;
     int hi = fabsf(x) >= DECLIP_THRESHOLD;
@@ -219,7 +242,7 @@ static inline float declip_push(declipper *d, int c, float x) {
         if (hi) {
             // Dipped for one sample and came back: same plateau.
         } else {
-            declip_fix(d, c, d->run_start[c], d->run_end[c]);
+            if (repair) declip_fix(d, c, d->run_start[c], d->run_end[c]);
             d->in_run[c] = 0;
         }
     } else if (d->in_run[c]) {
@@ -240,6 +263,7 @@ static inline float declip_push(declipper *d, int c, float x) {
 
 static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     // buf is interleaved stereo, processed in place.
+    take_pending_params(s);
     const leveler_params *p = &s->p;
     float env = s->env, ms = s->ms, peak_env = s->peak_env;
     float speech_db = s->speech_db, boost_db = s->boost_db;
@@ -251,11 +275,11 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
 
     for (unsigned i = 0; i < frames; i++) {
         float l = buf[2 * i], r = buf[2 * i + 1];
-        if (p->declip) {
-            l = declip_push(&s->dc, 0, l);
-            r = declip_push(&s->dc, 1, r);
-            s->dc.w++;
-        }
+        // The delay line always runs, so turning repair on or off doesn't
+        // shift the audio.
+        l = declip_push(&s->dc, 0, l, p->declip);
+        r = declip_push(&s->dc, 1, r, p->declip);
+        s->dc.w++;
         float x = max_f(fabsf(l), fabsf(r));
         in_peak = max_f(in_peak, x);
 
@@ -378,16 +402,18 @@ void leveler_record(leveler_state *s, float *in_buf, float *out_buf, unsigned fr
 
 unsigned leveler_recorded_frames(leveler_state *s) { return atomic_load(&s->rec_pos); }
 
-static void record(leveler_state *s, float *buf, const float *stereo, unsigned frames, unsigned pos) {
+static void record(leveler_state *s, float *const *slot, const float *stereo, unsigned frames, unsigned pos) {
     unsigned cap = atomic_load(&s->rec_cap);
-    if (!buf || pos >= cap) return;
+    if (pos >= cap) return;
+    float *buf = *slot;
+    if (!buf) return;
     unsigned n = cap - pos < frames ? cap - pos : frames;
     memcpy(buf + 2 * (size_t)pos, stereo, 2 * n * sizeof(float));
 }
 
 static void run(leveler_state *s, float *stereo, unsigned frames) {
     unsigned pos = atomic_load(&s->rec_pos);
-    record(s, s->rec_in, stereo, frames, pos);
+    record(s, &s->rec_in, stereo, frames, pos);
     if (atomic_load(&s->bypass)) {
         float peak = 0.0f;
         for (unsigned i = 0; i < 2 * frames; i++) peak = max_f(peak, fabsf(stereo[i]));
@@ -396,7 +422,7 @@ static void run(leveler_state *s, float *stereo, unsigned frames) {
     } else {
         process_stereo(s, stereo, frames);
     }
-    record(s, s->rec_out, stereo, frames, pos);
+    record(s, &s->rec_out, stereo, frames, pos);
     unsigned cap = atomic_load(&s->rec_cap);
     if (pos < cap) atomic_store(&s->rec_pos, pos + frames < cap ? pos + frames : cap);
     atomic_fetch_add(&s->frames, frames);

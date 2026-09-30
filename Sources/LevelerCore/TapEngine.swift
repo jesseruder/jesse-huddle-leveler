@@ -34,35 +34,53 @@ public final class TapEngine {
         leveler_set_params(state, params)
     }
 
-    private var recIn: [Float] = []
-    private var recOut: [Float] = []
+    // Recording buffers stay allocated until the IOProc is stopped, because
+    // the audio thread may still be writing to them after recording ends.
+    private var recIn: UnsafeMutablePointer<Float>?
+    private var recOut: UnsafeMutablePointer<Float>?
+    private var recFrames = 0
 
-    /// Records the next `seconds` of raw and processed audio. Restarting the
-    /// engine (a device or process change) drops the recording.
-    public func startRecording(seconds: Double) {
-        let frames = Int(seconds * (sampleRate > 0 ? sampleRate : 48000))
-        recIn = [Float](repeating: 0, count: frames * 2)
-        recOut = [Float](repeating: 0, count: frames * 2)
-        recIn.withUnsafeMutableBufferPointer { i in
-            recOut.withUnsafeMutableBufferPointer { o in
-                leveler_record(state, i.baseAddress, o.baseAddress, UInt32(frames))
-            }
-        }
+    /// Records the next `seconds` of raw and processed audio. Once per run:
+    /// returns false if this run already recorded. Restarting the engine (a
+    /// device or process change) drops the recording.
+    @discardableResult
+    public func startRecording(seconds: Double) -> Bool {
+        guard recIn == nil else { return false }
+        recFrames = Int(seconds * (sampleRate > 0 ? sampleRate : 48000))
+        let i = UnsafeMutablePointer<Float>.allocate(capacity: recFrames * 2)
+        let o = UnsafeMutablePointer<Float>.allocate(capacity: recFrames * 2)
+        i.initialize(repeating: 0, count: recFrames * 2)
+        o.initialize(repeating: 0, count: recFrames * 2)
+        recIn = i
+        recOut = o
+        leveler_record(state, i, o, UInt32(recFrames))
+        return true
     }
 
     public var recordingDone: Bool {
-        !recIn.isEmpty && Int(leveler_recorded_frames(state)) * 2 >= recIn.count
+        recIn != nil && recFrames > 0 && Int(leveler_recorded_frames(state)) >= recFrames
     }
 
-    public var isRecording: Bool { !recIn.isEmpty }
+    public var isRecording: Bool { recIn != nil && recFrames > 0 }
 
-    /// Stops recording and returns what was recorded so far as interleaved
-    /// stereo (raw, processed).
+    /// Stops recording and returns a copy of what was recorded so far as
+    /// interleaved stereo (raw, processed).
     public func takeRecording() -> (raw: [Float], processed: [Float]) {
-        let frames = Int(leveler_recorded_frames(state))
+        guard let recIn, let recOut, recFrames > 0 else { return ([], []) }
+        let frames = min(Int(leveler_recorded_frames(state)), recFrames)
         leveler_record(state, nil, nil, 0)
-        defer { recIn = []; recOut = [] }
-        return (Array(recIn.prefix(frames * 2)), Array(recOut.prefix(frames * 2)))
+        recFrames = 0
+        return (Array(UnsafeBufferPointer(start: recIn, count: frames * 2)),
+                Array(UnsafeBufferPointer(start: recOut, count: frames * 2)))
+    }
+
+    /// Only once the IOProc can no longer run.
+    private func freeRecording() {
+        recIn?.deallocate()
+        recOut?.deallocate()
+        recIn = nil
+        recOut = nil
+        recFrames = 0
     }
 
     public var bypass: Bool {
@@ -78,8 +96,6 @@ public final class TapEngine {
             try checkFormats()
             sampleRate = try getValue(aggregateID, kAudioDevicePropertyNominalSampleRate, default: Float64(48000))
             leveler_init(state, params, Float(sampleRate))
-            recIn = []
-            recOut = []
             try check(leveler_create_ioproc(aggregateID, state, &procID), "AudioDeviceCreateIOProcID")
             try check(AudioDeviceStart(aggregateID, procID), "AudioDeviceStart")
             isRunning = true
@@ -110,6 +126,7 @@ public final class TapEngine {
                 tapID = AudioObjectID(kAudioObjectUnknown)
             }
         }
+        if procID == nil { freeRecording() }
         return procID == nil && aggregateID == kAudioObjectUnknown && tapID == kAudioObjectUnknown
     }
 
