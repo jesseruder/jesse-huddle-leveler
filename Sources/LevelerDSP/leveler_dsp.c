@@ -8,7 +8,9 @@
 struct leveler_state {
     leveler_params p;
     float rms_coef, attack_coef, release_coef, limiter_release_coef;
-    float speech_up_coef, speech_down_coef, boost_up_coef, peak_release_coef;
+    float speech_up_coef, speech_down_coef, speech_fresh_coef, boost_up_coef, peak_release_coef;
+    unsigned pause_frames, fresh_frames;  // turn-taking: silence so far, fast-tracking left
+    unsigned turn_gap_frames, fresh_window_frames;
     float ms;            // 50 ms mean square of the input
     float peak_env;      // instant-attack peak follower, to catch loud onsets
     float env;           // ms after attack/release smoothing (downward compressor)
@@ -55,7 +57,7 @@ leveler_params leveler_default_params(void) {
         .makeup_db = 0.0f,
         .gate_db = -55.0f,
         .ceiling_db = -0.5f,
-        .soften_db = 6.0f,
+        .soften_db = 10.0f,
     };
     return p;
 }
@@ -95,6 +97,9 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     s->rms_coef = coef_for_ms(50.0f, sample_rate);
     s->speech_up_coef = coef_for_ms(100.0f, sample_rate);
     s->speech_down_coef = coef_for_ms(1500.0f, sample_rate);
+    s->speech_fresh_coef = coef_for_ms(150.0f, sample_rate);
+    s->turn_gap_frames = (unsigned)(0.25f * sample_rate);
+    s->fresh_window_frames = (unsigned)(0.5f * sample_rate);
     s->boost_up_coef = coef_for_ms(50.0f, sample_rate);
     s->peak_release_coef = coef_for_ms(100.0f, sample_rate);
     s->speech_db = p.target_db;  // no gain change until someone has spoken
@@ -102,7 +107,7 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     s->release_coef = coef_for_ms(p.release_ms, sample_rate);
     s->limiter_release_coef = coef_for_ms(50.0f, sample_rate);
     s->limiter_gain = 1.0f;
-    s->soften_coef = 1.0f - expf(-2.0f * 3.14159265f * 3000.0f / sample_rate);
+    s->soften_coef = 1.0f - expf(-2.0f * 3.14159265f * 2500.0f / sample_rate);
     if (p.soften_db < 0.0f) s->p.soften_db = 0.0f;
     atomic_store(&s->meter_level_db, -120.0f);
 }
@@ -158,11 +163,20 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
         level_db = 10.0f * log10f(ms + 1e-12f);
 
         // Talker leveling. Track the talker's level only while someone is
-        // talking, so pauses hold the gain, and follow a louder talker within
-        // ~100 ms and a quieter one over ~1.5 s.
+        // talking, so pauses hold the gain. Follow a louder talker within
+        // ~100 ms. Within a stretch of speech, follow a quieter level over
+        // ~1.5 s so soft syllables don't pump the gain; but for the first
+        // half second after a pause of 250 ms or more, when a new talker has
+        // likely taken over, follow it within ~150 ms.
         if (level_db > p->gate_db) {
-            float c = level_db > speech_db ? s->speech_up_coef : s->speech_down_coef;
+            if (s->pause_frames >= s->turn_gap_frames) s->fresh_frames = s->fresh_window_frames;
+            s->pause_frames = 0;
+            float down = s->fresh_frames > 0 ? s->speech_fresh_coef : s->speech_down_coef;
+            if (s->fresh_frames > 0) s->fresh_frames--;
+            float c = level_db > speech_db ? s->speech_up_coef : down;
             speech_db = c * speech_db + (1.0f - c) * level_db;
+        } else if (s->pause_frames < s->turn_gap_frames) {
+            s->pause_frames++;
         }
         float target = gain_for_speech_db(p, speech_db);
         boost_db = s->boost_up_coef * boost_db + (1.0f - s->boost_up_coef) * target;
@@ -187,11 +201,11 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
         l *= g;
         r *= g;
 
-        // Soften loud talkers: split at ~3 kHz and turn the top down.
+        // Soften loud talkers: split at ~2.5 kHz and turn the top down.
         lp_l += s->soften_coef * (l - lp_l);
         lp_r += s->soften_coef * (r - lp_r);
         if (p->soften_db > 0.0f && boost_db < 0.0f) {
-            float amount = clamp_f(-boost_db / 8.0f, 0.0f, 1.0f);
+            float amount = clamp_f(-boost_db / 5.0f, 0.0f, 1.0f);
             float treble = db_to_lin(-p->soften_db * amount);
             l = lp_l + treble * (l - lp_l);
             r = lp_r + treble * (r - lp_r);

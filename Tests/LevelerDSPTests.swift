@@ -123,6 +123,26 @@ final class LevelerDSPTests: XCTestCase {
         XCTAssertEqual(out(-21, soften: 6), out(-21, soften: 0), accuracy: 0.05)
     }
 
+    func testQuietTalkerAfterLoudOneIsNotLeftTurnedDown() {
+        let s = leveler_create()!
+        defer { leveler_destroy(s) }
+        leveler_init(s, leveler_default_params(), rate)
+        // 4 s of a loud talker, a 0.5 s gap, then a quiet talker.
+        let loudEnd = Int(rate) * 4, quietStart = loudEnd + Int(rate / 2), n = quietStart + Int(rate) * 2
+        var buf = [Float](repeating: 0, count: n * 2)
+        for i in 0..<n {
+            let amp: Float = i < loudEnd ? 0.5 : (i < quietStart ? 0 : 0.02)
+            let v = amp * sinf(2 * .pi * 220 * Float(i) / rate)
+            buf[2 * i] = v
+            buf[2 * i + 1] = v
+        }
+        buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, UInt32(n), 2) }
+        // 0.7 s into the quiet talker it should be raised, not still cut.
+        let from = quietStart + Int(rate * 0.7), to = from + Int(rate / 10)
+        let peak = buf[(2 * from)..<(2 * to)].map(abs).max()!
+        XCTAssertGreaterThan(peak, 0.02)
+    }
+
     func testCeilingHolds() {
         let s = leveler_create()!
         defer { leveler_destroy(s) }

@@ -37,7 +37,7 @@ fast downward compression (off by default):
 
   --ceiling <dB>      peak limiter ceiling [-0.5]
   --soften <dB>       treble cut for loud talkers, to soften a clipping mic;
-                      0 = off [6]
+                      0 = off [10]
 
 other:
   --list              list processes using audio and output devices, then exit
@@ -268,13 +268,20 @@ func drawMeter() {
         silentTicks = 0
         let playing = (try? audioProcesses().filter(matches).contains(where: \.isPlaying)) ?? false
         if playing {
-            // Most likely missing permission. The tap keeps the app muted, so
-            // stop tapping and let its audio play unprocessed; the next
-            // process or device change tries again.
+            // Either permission is missing or nobody has spoken yet; the
+            // samples can't tell which. The tap keeps the app muted, so stop
+            // tapping and let its audio play unprocessed, then try again in
+            // 30 s (or sooner on a process or device change).
             engine.stop()
             stoppedSilent = true
             status = "stopped: tap was silent"
-            log("Tap received only silence for 10 s while \(targetName) was playing, so it stopped and \(targetName) plays unprocessed. Check System Settings → Privacy & Security → Screen & System Audio Recording for your terminal.")
+            log("Tap received only silence for 10 s while \(targetName) was playing, so \(targetName) plays unprocessed for now; retrying in 30 s. If this repeats while people are talking, check System Settings → Privacy & Security → Screen & System Audio Recording for your terminal.")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+                guard stoppedSilent else { return }
+                stoppedSilent = false
+                tapped = []
+                reconcile()
+            }
             return
         }
     }

@@ -21,9 +21,9 @@ typedef struct {
     float makeup_db;     // gain added back after compression
     float gate_db;       // below this, boost and makeup fade out so room noise isn't lifted
     float ceiling_db;    // peak limiter ceiling
-    // Treble cut above ~3 kHz for loud talkers, to soften the fizz of a mic
+    // Treble cut above ~2.5 kHz for loud talkers, to soften the fizz of a mic
     // that clips before the audio reaches us. Scales with how far the talker
-    // is being turned down: full at a cut of 8 dB or more. 0 turns it off.
+    // is being turned down: full at a cut of 5 dB or more. 0 turns it off.
     float soften_db;
 } leveler_params;
 
