@@ -19,15 +19,22 @@ what to tap:
   --output <text>     play to the output device whose name contains <text>
                       (default: the system default output, following changes)
 
-compressor (defaults in brackets):
-  --threshold <dB>    level where compression starts [-40]
-  --ratio <n>         compression ratio [4]
+raising quiet voices (defaults in brackets; levels are short-term RMS dBFS):
+  --boost-below <dB>  voices quieter than this are raised toward it [-24]
+  --boost-ratio <n>   3 = a voice 12 dB under comes out 4 dB under [3]
+  --max-boost <dB>    most any voice is raised [12]
+  --gate <dB>         below this, boost fades out so noise isn't lifted [-55]
+
+taming loud voices (off by default):
+  --threshold <dB>    level where downward compression starts [-20]
+  --ratio <n>         downward compression ratio; 1 = off [1]
   --knee <dB>         soft knee width [10]
+  --makeup <dB>       gain added after compression [0]
+
   --attack <ms>       [10]
   --release <ms>      [300]
-  --makeup <dB>       gain added after compression [15]
-  --gate <dB>         below this, makeup gain fades out so noise isn't lifted [-55]
-  --ceiling <dB>      peak limiter ceiling [-1]
+
+  --ceiling <dB>      peak limiter ceiling [-0.5]
 
 other:
   --list              list processes using audio and output devices, then exit
@@ -71,6 +78,9 @@ while !args.isEmpty {
         guard let p = pid_t(next(a)) else { fail("--pid needs a number") }
         pids.append(p)
     case "--output": outputMatch = next(a)
+    case "--boost-below": params.boost_below_db = number(a)
+    case "--boost-ratio": params.boost_ratio = max(1, number(a))
+    case "--max-boost": params.max_boost_db = max(0, number(a))
     case "--threshold": params.threshold_db = number(a)
     case "--ratio": params.ratio = max(1, number(a))
     case "--knee": params.knee_db = max(0, number(a))
@@ -179,8 +189,11 @@ let targetName = !pids.isEmpty ? "pid \(pids.map(String.init).joined(separator: 
 let engine = TapEngine(params: params)
 var tapped: [AudioObjectID] = []
 var tappedOutput = ""
+var stoppedSilent = false
 var status = "starting"
 let isTTY = isatty(STDOUT_FILENO) != 0
+// Line-buffer stdout so a log file or pipe sees each line as it happens.
+setvbuf(stdout, nil, _IOLBF, 0)
 
 func log(_ line: String) {
     if isTTY && !quiet { print("\r\u{1B}[K", terminator: "") }
@@ -192,7 +205,8 @@ func reconcile() {
         let procs = try audioProcesses().filter(matches)
         let ids = procs.map(\.id).sorted()
         let output = try chooseOutput()
-        if ids == tapped && output.uid == tappedOutput && (engine.isRunning || ids.isEmpty) { return }
+        if ids == tapped && output.uid == tappedOutput && (engine.isRunning || ids.isEmpty || stoppedSilent) { return }
+        stoppedSilent = false
         engine.stop()
         tapped = ids
         tappedOutput = output.uid
@@ -239,10 +253,18 @@ func drawMeter() {
     // while the app reports it is playing: that is what a missing permission looks like.
     if m.frames != lastFrames && m.in_peak == 0 { silentTicks += 1 } else { silentTicks = 0 }
     lastFrames = m.frames
-    if silentTicks == 100 {
+    if silentTicks >= 100 {
+        silentTicks = 0
         let playing = (try? audioProcesses().filter(matches).contains(where: \.isPlaying)) ?? false
         if playing {
-            log("Tap is running but receiving silence while \(targetName) is playing. Check System Settings → Privacy & Security → Screen & System Audio Recording for your terminal.")
+            // Most likely missing permission. The tap keeps the app muted, so
+            // stop tapping and let its audio play unprocessed; the next
+            // process or device change tries again.
+            engine.stop()
+            stoppedSilent = true
+            status = "stopped: tap was silent"
+            log("Tap received only silence for 10 s while \(targetName) was playing, so it stopped and \(targetName) plays unprocessed. Check System Settings → Privacy & Security → Screen & System Audio Recording for your terminal.")
+            return
         }
     }
     guard !quiet else { return }

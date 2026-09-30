@@ -34,10 +34,11 @@ final class TapEngine {
     }
 
     func start(processes: [AudioObjectID], output: OutputDevice) throws {
-        stop()
+        guard stop() else { throw TeardownFailed() }
         do {
             try createTap(processes: processes)
             try createAggregate(output: output)
+            try checkFormats()
             sampleRate = try getValue(aggregateID, kAudioDevicePropertyNominalSampleRate, default: Float64(48000))
             leveler_init(state, params, Float(sampleRate))
             try check(leveler_create_ioproc(aggregateID, state, &procID), "AudioDeviceCreateIOProcID")
@@ -49,21 +50,52 @@ final class TapEngine {
         }
     }
 
-    func stop() {
+    /// Tears everything down. An object whose destroy call fails keeps its ID
+    /// so the next stop() retries it; start() refuses to run until it's gone.
+    @discardableResult
+    func stop() -> Bool {
+        isRunning = false
         if let procID {
             AudioDeviceStop(aggregateID, procID)
-            AudioDeviceDestroyIOProcID(aggregateID, procID)
-            self.procID = nil
+            if report(AudioDeviceDestroyIOProcID(aggregateID, procID), "AudioDeviceDestroyIOProcID") {
+                self.procID = nil
+            }
         }
-        if aggregateID != kAudioObjectUnknown {
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = AudioObjectID(kAudioObjectUnknown)
+        if aggregateID != kAudioObjectUnknown && procID == nil {
+            if report(AudioHardwareDestroyAggregateDevice(aggregateID), "AudioHardwareDestroyAggregateDevice") {
+                aggregateID = AudioObjectID(kAudioObjectUnknown)
+            }
         }
-        if tapID != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(tapID)
-            tapID = AudioObjectID(kAudioObjectUnknown)
+        if tapID != kAudioObjectUnknown && aggregateID == kAudioObjectUnknown {
+            if report(AudioHardwareDestroyProcessTap(tapID), "AudioHardwareDestroyProcessTap") {
+                tapID = AudioObjectID(kAudioObjectUnknown)
+            }
         }
-        isRunning = false
+        return procID == nil && aggregateID == kAudioObjectUnknown && tapID == kAudioObjectUnknown
+    }
+
+    private func report(_ status: OSStatus, _ what: String) -> Bool {
+        if status == noErr || status == kAudioHardwareBadObjectError { return true }
+        FileHandle.standardError.write("huddle-leveler: \(CoreAudioError(what: what, status: status))\n".data(using: .utf8)!)
+        return false
+    }
+
+    /// The IOProc only understands 32-bit float PCM, so refuse anything else
+    /// rather than misread the buffers.
+    private func checkFormats() throws {
+        for scope in [kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput] {
+            let streams = try getArray(aggregateID, kAudioDevicePropertyStreams, scope: scope, of: AudioStreamID.self)
+            for stream in streams {
+                let f = try getValue(stream, kAudioStreamPropertyVirtualFormat, default: AudioStreamBasicDescription())
+                let isFloat32 = f.mFormatID == kAudioFormatLinearPCM
+                    && f.mFormatFlags & kAudioFormatFlagIsFloat != 0
+                    && f.mFormatFlags & kAudioFormatFlagIsBigEndian == 0
+                    && f.mBitsPerChannel == 32
+                if !isFloat32 {
+                    throw UnsupportedFormat(description: "stream \(stream) is not 32-bit float PCM (format \(f.mFormatID), flags \(f.mFormatFlags), \(f.mBitsPerChannel) bits)")
+                }
+            }
+        }
     }
 
     private var tapUUID = UUID()
@@ -95,4 +127,12 @@ final class TapEngine {
         try check(AudioHardwareCreateAggregateDevice(config as CFDictionary, &aggregateID),
                   "AudioHardwareCreateAggregateDevice")
     }
+}
+
+struct UnsupportedFormat: Error, CustomStringConvertible {
+    let description: String
+}
+
+struct TeardownFailed: Error, CustomStringConvertible {
+    var description: String { "the previous tap could not be torn down" }
 }

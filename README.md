@@ -23,16 +23,25 @@ System Audio Recording Only).
 
 ## Tuning
 
-    .build/release/huddle-leveler --curve                 # show what the settings do
-    .build/release/huddle-leveler --ratio 6 --makeup 18   # squash harder
+    .build/release/huddle-leveler --curve                    # show what the settings do
+    .build/release/huddle-leveler --boost-below -20 --max-boost 15   # lift quiet voices more
+    .build/release/huddle-leveler --ratio 4 --threshold -20  # also pull loud voices down
     .build/release/huddle-leveler --process-file in.wav out.wav
 
-Defaults: threshold -40 dBFS, ratio 4:1, 10 dB knee, attack 10 ms, release
-300 ms, makeup +15 dB, peak ceiling -1 dBFS. A voice at -20 dBFS RMS comes out
-unchanged. Louder voices are pulled down toward it and quieter ones lifted.
-Below the gate (-55 dBFS) the makeup gain fades out, so silence and room noise
-aren't boosted. On synthesized speech, a 15 dB gap between two voices comes out
-about 7 dB apart; a 28 dB gap comes out about 12 dB apart.
+By default it only raises quiet voices; loud ones pass through untouched,
+because Slack's huddle audio already peaks near full scale and pulling it down
+is audible. It tracks the level of whoever is talking (only while someone is
+talking, so pauses don't ramp the gain up) and moves toward a new talker over a
+second or so. A talker quieter than -24 dBFS RMS is raised toward it at 3:1,
+by up to 12 dB. The boost never pushes a peak above -10 dBFS, so a loud talker
+starting right after a quiet one isn't boosted. Below the gate (-55 dBFS)
+nothing is raised.
+
+On synthesized speech, a talker 19 dB under a loud one comes up 5-6 dB, and the
+loud one passes through unchanged.
+
+Downward compression (`--ratio`, `--threshold`, `--makeup`, `--attack`,
+`--release`) is still there but off by default.
 
 ## Notes
 

@@ -6,13 +6,19 @@
 // Compressor settings. Levels are dBFS measured as a short-term RMS of the
 // louder channel, so ordinary speech sits somewhere around -35..-15 dBFS.
 typedef struct {
+    // Upward compression: voices quieter than boost_below_db are raised
+    // toward it; louder ones are left alone.
+    float boost_below_db;
+    float boost_ratio;   // 3 = a voice 12 dB under the target comes out 4 dB under
+    float max_boost_db;  // never raise anything by more than this
+    // Downward compression, off at ratio 1.
     float threshold_db;  // compression starts here
     float ratio;         // 4 = every 4 dB over the threshold comes out as 1 dB
     float knee_db;       // width of the soft knee around the threshold
     float attack_ms;     // how fast the detector reacts to getting louder
     float release_ms;    // how fast it lets go when things get quieter
     float makeup_db;     // gain added back after compression
-    float gate_db;       // below this, makeup gain fades out so room noise isn't lifted
+    float gate_db;       // below this, boost and makeup fade out so room noise isn't lifted
     float ceiling_db;    // peak limiter ceiling
 } leveler_params;
 
