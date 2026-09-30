@@ -5,8 +5,35 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Declipper: finds plateaus where the audio sat at full scale (a mic that
+// clipped before the audio reached Slack) and redraws each one as a smooth
+// peak through the samples on either side. Works on a short delay line so a
+// whole plateau is seen before any of it is played.
+enum { DECLIP_RING = 128, DECLIP_DELAY = 96 };
+#define DECLIP_THRESHOLD 0.97f
+#define DECLIP_MAX 2.0f
+
+typedef struct {
+    float ring[2][DECLIP_RING];
+    unsigned w;                 // samples written per channel
+    int in_run[2], pending[2];
+    unsigned run_start[2], run_end[2];
+} declipper;
+
+enum { LIM_AHEAD = 128, LIM_RING = 256 };
+
+typedef struct {
+    float dl[LIM_RING], dr[LIM_RING];  // delayed audio
+    float need[LIM_RING];              // gain each sample needs to stay under the ceiling
+    float held[LIM_AHEAD];             // released minimum gain, for the running average
+    float sum;
+    unsigned pos;
+} limiter;
+
 struct leveler_state {
     leveler_params p;
+    declipper dc;
+    limiter lim;
     float sample_rate;
     float rms_coef, attack_coef, release_coef, limiter_release_coef;
     float speech_up_coef, speech_down_coef, speech_fresh_coef, boost_up_coef, peak_release_coef;
@@ -21,6 +48,8 @@ struct leveler_state {
     float soften_coef;   // one-pole low-pass coefficient for the treble cut
     float lp_l, lp_r;    // low-pass state for the treble cut
     atomic_int bypass;   // pass audio through untouched
+    float *rec_in, *rec_out;
+    atomic_uint rec_cap, rec_pos;
 
     // Meters, written by the audio thread and read (and reset) by the UI.
     _Atomic float meter_in_peak;   // linear peak of the input
@@ -59,6 +88,7 @@ leveler_params leveler_default_params(void) {
         .gate_db = -55.0f,
         .ceiling_db = -0.5f,
         .soften_db = 10.0f,
+        .declip = 1,
     };
     return p;
 }
@@ -114,6 +144,9 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     s->speech_db = s->p.target_db;  // no gain change until someone has spoken
     s->limiter_release_coef = coef_for_ms(50.0f, sample_rate);
     s->limiter_gain = 1.0f;
+    for (unsigned i = 0; i < LIM_RING; i++) s->lim.need[i] = 1.0f;
+    for (unsigned i = 0; i < LIM_AHEAD; i++) s->lim.held[i] = 1.0f;
+    s->lim.sum = (float)LIM_AHEAD;
     s->soften_coef = 1.0f - expf(-2.0f * 3.14159265f * 2500.0f / sample_rate);
     atomic_store(&s->meter_level_db, -120.0f);
 }
@@ -150,6 +183,61 @@ float leveler_static_gain_db(const leveler_params *p, float level_db) {
     return downward_gain_db(p, level_db) + boost;
 }
 
+// Replaces ring samples a..b of channel c with the cubic through a-2, a-1,
+// b+1, b+2, where they bulge past the original.
+static void declip_fix(declipper *d, int c, unsigned a, unsigned b) {
+    float *ring = d->ring[c];
+    unsigned n = b - a + 1;
+    if (n < 3 || d->w - (a - 2) >= DECLIP_DELAY) return;  // too short, or already played
+    float t[4] = {-2.0f, -1.0f, (float)n, (float)n + 1.0f};
+    float y[4] = {ring[(a - 2) % DECLIP_RING], ring[(a - 1) % DECLIP_RING],
+                  ring[(b + 1) % DECLIP_RING], ring[(b + 2) % DECLIP_RING]};
+    float sign = ring[a % DECLIP_RING] < 0.0f ? -1.0f : 1.0f;
+    for (unsigned k = 0; k < n; k++) {
+        float x = (float)k, v = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            float term = y[i];
+            for (int j = 0; j < 4; j++)
+                if (j != i) term *= (x - t[j]) / (t[i] - t[j]);
+            v += term;
+        }
+        float *slot = &ring[(a + k) % DECLIP_RING];
+        float mag = clamp_f(v * sign, 0.0f, DECLIP_MAX);
+        if (mag > fabsf(*slot)) *slot = sign * mag;
+    }
+}
+
+// Pushes one sample of channel c and returns the sample DECLIP_DELAY behind.
+// Call for channel 0 and 1, then advance d->w.
+static inline float declip_push(declipper *d, int c, float x) {
+    unsigned w = d->w;
+    d->ring[c][w % DECLIP_RING] = x;
+    int hi = fabsf(x) >= DECLIP_THRESHOLD;
+    if (d->pending[c]) {
+        // Two samples past the plateau: fit and replace it.
+        d->pending[c] = 0;
+        if (hi) {
+            // Dipped for one sample and came back: same plateau.
+        } else {
+            declip_fix(d, c, d->run_start[c], d->run_end[c]);
+            d->in_run[c] = 0;
+        }
+    } else if (d->in_run[c]) {
+        if (!hi) {
+            d->run_end[c] = w - 1;
+            d->pending[c] = 1;
+        }
+    } else if (hi) {
+        d->in_run[c] = 1;
+        d->run_start[c] = w;
+    }
+    if (d->in_run[c] && w - d->run_start[c] > DECLIP_DELAY - 8) {
+        d->in_run[c] = 0;  // longer than the window can fix
+        d->pending[c] = 0;
+    }
+    return w >= DECLIP_DELAY ? d->ring[c][(w - DECLIP_DELAY) % DECLIP_RING] : 0.0f;
+}
+
 static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     // buf is interleaved stereo, processed in place.
     const leveler_params *p = &s->p;
@@ -163,6 +251,11 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
 
     for (unsigned i = 0; i < frames; i++) {
         float l = buf[2 * i], r = buf[2 * i + 1];
+        if (p->declip) {
+            l = declip_push(&s->dc, 0, l);
+            r = declip_push(&s->dc, 1, r);
+            s->dc.w++;
+        }
         float x = max_f(fabsf(l), fabsf(r));
         in_peak = max_f(in_peak, x);
 
@@ -219,13 +312,37 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
             r = lp_r + treble * (r - lp_r);
         }
 
-        // Peak limiter: recover over ~50 ms, but never past what keeps this
-        // sample under the ceiling.
+        // Lookahead limiter. The gain each sample needs is known LIM_AHEAD
+        // samples before it plays: take the lowest need in the lookahead
+        // window, let it recover over ~50 ms, and average it over the window
+        // so the gain glides down before a peak instead of chopping it off.
+        // Every averaged value is at most the need of the sample being
+        // played, so the ceiling holds.
+        limiter *lm = &s->lim;
+        unsigned k = lm->pos % LIM_RING;
         float peak = max_f(fabsf(l), fabsf(r));
+        lm->need[k] = peak > ceiling ? ceiling / peak : 1.0f;
+        lm->dl[k] = l;
+        lm->dr[k] = r;
+        float window_min = 1.0f;
+        for (unsigned j = 0; j <= LIM_AHEAD; j++) {
+            float v = lm->need[(lm->pos - j) % LIM_RING];
+            if (v < window_min) window_min = v;
+        }
         lim = 1.0f - (1.0f - lim) * s->limiter_release_coef;
-        if (peak * lim > ceiling) lim = ceiling / peak;
-        l = clamp_f(l * lim, -1.0f, 1.0f);
-        r = clamp_f(r * lim, -1.0f, 1.0f);
+        if (window_min < lim) lim = window_min;
+        lm->sum += lim - lm->held[k % LIM_AHEAD];
+        lm->held[k % LIM_AHEAD] = lim;
+        if (k % LIM_AHEAD == 0) {
+            // Re-add from scratch now and then so float error can't build up.
+            lm->sum = 0.0f;
+            for (unsigned j = 0; j < LIM_AHEAD; j++) lm->sum += lm->held[j];
+        }
+        float g_lim = lm->sum / (float)LIM_AHEAD;
+        unsigned out = (lm->pos - LIM_AHEAD) % LIM_RING;
+        l = clamp_f(lm->dl[out] * g_lim, -1.0f, 1.0f);
+        r = clamp_f(lm->dr[out] * g_lim, -1.0f, 1.0f);
+        lm->pos++;
 
         out_peak = max_f(out_peak, max_f(fabsf(l), fabsf(r)));
         buf[2 * i] = l;
@@ -251,7 +368,26 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     atomic_store(&s->meter_gain_db, gain_db + 20.0f * log10f(lim));
 }
 
+void leveler_record(leveler_state *s, float *in_buf, float *out_buf, unsigned frames) {
+    atomic_store(&s->rec_cap, 0);
+    s->rec_in = in_buf;
+    s->rec_out = out_buf;
+    atomic_store(&s->rec_pos, 0);
+    atomic_store(&s->rec_cap, frames);
+}
+
+unsigned leveler_recorded_frames(leveler_state *s) { return atomic_load(&s->rec_pos); }
+
+static void record(leveler_state *s, float *buf, const float *stereo, unsigned frames, unsigned pos) {
+    unsigned cap = atomic_load(&s->rec_cap);
+    if (!buf || pos >= cap) return;
+    unsigned n = cap - pos < frames ? cap - pos : frames;
+    memcpy(buf + 2 * (size_t)pos, stereo, 2 * n * sizeof(float));
+}
+
 static void run(leveler_state *s, float *stereo, unsigned frames) {
+    unsigned pos = atomic_load(&s->rec_pos);
+    record(s, s->rec_in, stereo, frames, pos);
     if (atomic_load(&s->bypass)) {
         float peak = 0.0f;
         for (unsigned i = 0; i < 2 * frames; i++) peak = max_f(peak, fabsf(stereo[i]));
@@ -260,6 +396,9 @@ static void run(leveler_state *s, float *stereo, unsigned frames) {
     } else {
         process_stereo(s, stereo, frames);
     }
+    record(s, s->rec_out, stereo, frames, pos);
+    unsigned cap = atomic_load(&s->rec_cap);
+    if (pos < cap) atomic_store(&s->rec_pos, pos + frames < cap ? pos + frames : cap);
     atomic_fetch_add(&s->frames, frames);
 }
 

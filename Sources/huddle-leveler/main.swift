@@ -38,6 +38,7 @@ fast downward compression (off by default):
   --ceiling <dB>      peak limiter ceiling [-0.5]
   --soften <dB>       treble cut for loud talkers, to soften a clipping mic;
                       0 = off [10]
+  --no-declip         don't redraw peaks flattened by a clipping mic
 
 other:
   --list              list processes using audio and output devices, then exit
@@ -45,6 +46,9 @@ other:
   --process-file <in> <out>
                       run an audio file through the compressor, for tuning
   --quiet             don't draw the level meter
+  --record <prefix>   save raw and processed audio to <prefix>-raw.wav and
+                      <prefix>-processed.wav: the first --record-seconds [30],
+                      or what's recorded so far on SIGUSR1 or quit
 """
 
 func fail(_ message: String) -> Never {
@@ -61,6 +65,8 @@ var outputMatch: String?
 var mode = "run"
 var fileArgs: [String] = []
 var quiet = false
+var recordPrefix: String?
+var recordSeconds = 30.0
 
 var args = Array(CommandLine.arguments.dropFirst())
 func next(_ flag: String) -> String {
@@ -94,10 +100,13 @@ while !args.isEmpty {
     case "--gate": params.gate_db = number(a)
     case "--ceiling": params.ceiling_db = min(0, number(a))
     case "--soften": params.soften_db = max(0, number(a))
+    case "--no-declip": params.declip = 0
     case "--list": mode = "list"
     case "--curve": mode = "curve"
     case "--process-file": mode = "file"; fileArgs = [next(a), next(a)]
     case "--quiet": quiet = true
+    case "--record": recordPrefix = next(a)
+    case "--record-seconds": recordSeconds = Double(max(1, number(a)))
     default: fail("unknown option \(a)\n\n\(usage)")
     }
 }
@@ -220,15 +229,57 @@ func drawMeter(_ m: leveler_meters, bypass: Bool) {
     FileHandle.standardOutput.write(line.data(using: .utf8)!)
 }
 
+/// Writes interleaved stereo float samples as a 32-bit float WAV.
+func writeWAV(_ samples: [Float], sampleRate: Double, to path: String) throws {
+    var d = Data()
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    let bytes = UInt32(samples.count * 4)
+    d.append(contentsOf: Array("RIFF".utf8)); u32(36 + bytes); d.append(contentsOf: Array("WAVE".utf8))
+    d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(3); u16(2)
+    u32(UInt32(sampleRate)); u32(UInt32(sampleRate) * 8); u16(8); u16(32)
+    d.append(contentsOf: Array("data".utf8)); u32(bytes)
+    samples.withUnsafeBufferPointer { d.append(UnsafeBufferPointer(start: UnsafeRawPointer($0.baseAddress!).assumingMemoryBound(to: UInt8.self), count: samples.count * 4)) }
+    try d.write(to: URL(fileURLWithPath: path))
+}
+
 var keepAlive: [Any] = []
 
 func runLive() {
     let controller = LevelerController(target: target, params: params)
     controller.outputNameMatch = outputMatch
     controller.onLog = log
-    controller.onMeters = { [unowned controller] m in drawMeter(m, bypass: controller.bypass) }
+    var recording = false
+    func saveRecording() {
+        let engine = controller.tapEngine
+        guard let prefix = recordPrefix, engine.isRecording else { return }
+        let (raw, processed) = engine.takeRecording()
+        recordPrefix = nil
+        do {
+            try writeWAV(raw, sampleRate: engine.sampleRate, to: prefix + "-raw.wav")
+            try writeWAV(processed, sampleRate: engine.sampleRate, to: prefix + "-processed.wav")
+            log(String(format: "Saved %.0f s to %@-raw.wav and %@-processed.wav.",
+                       Double(raw.count / 2) / engine.sampleRate, prefix, prefix))
+        } catch {
+            log("Could not save the recording: \(error)")
+        }
+    }
+    controller.onMeters = { [unowned controller] m in
+        drawMeter(m, bypass: controller.bypass)
+        guard recordPrefix != nil else { return }
+        let engine = controller.tapEngine
+        if !recording {
+            recording = true
+            engine.startRecording(seconds: recordSeconds)
+            log("Recording up to \(Int(recordSeconds)) s of raw and processed audio (kill -USR1 \(getpid()) to save early).")
+        } else if engine.recordingDone {
+            saveRecording()
+        }
+    }
+    controller.onStateChange = { _ in recording = false }
 
     func shutdown() {
+        saveRecording()
         controller.deactivate()
         if isTTY && !quiet { print("") }
         print("Stopped; \(target.name) audio is back to normal.")
@@ -236,9 +287,10 @@ func runLive() {
     }
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
-    let signals = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+    signal(SIGUSR1, SIG_IGN)
+    let signals = [SIGINT, SIGTERM, SIGUSR1].map { sig -> DispatchSourceSignal in
         let s = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-        s.setEventHandler(handler: shutdown)
+        s.setEventHandler(handler: sig == SIGUSR1 ? saveRecording : shutdown)
         s.resume()
         return s
     }

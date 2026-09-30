@@ -25,6 +25,9 @@ typedef struct {
     // that clips before the audio reaches us. Scales with how far the talker
     // is being turned down: full at a cut of 5 dB or more. 0 turns it off.
     float soften_db;
+    // Redraw peaks flattened at full scale by a clipping mic. Adds ~2 ms of
+    // delay. 0 turns it off.
+    int declip;
 } leveler_params;
 
 typedef struct leveler_state leveler_state;
@@ -51,6 +54,12 @@ void leveler_set_bypass(leveler_state *s, int bypass);
 int leveler_get_bypass(leveler_state *s);
 // Returns the meters and resets the peaks.
 leveler_meters leveler_take_meters(leveler_state *s);
+
+// Records the next `frames` stereo frames of input and output into caller-
+// owned interleaved buffers (2 * frames floats each), for diagnosis. The
+// buffers must outlive the recording; leveler_init stops it.
+void leveler_record(leveler_state *s, float *in_buf, float *out_buf, unsigned frames);
+unsigned leveler_recorded_frames(leveler_state *s);
 
 // Static gain (dB) the compressor applies to a signal at level_db, ignoring
 // attack and release. Exposed for tests and for printing a curve.

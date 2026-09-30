@@ -53,6 +53,9 @@ public final class LevelerController {
     /// Called every 100 ms while active with the meters since the last call.
     public var onMeters: ((leveler_meters) -> Void)?
 
+    /// The engine, for diagnostics such as recording.
+    public var tapEngine: TapEngine { engine }
+
     public private(set) var isActive = false
     public var sampleRate: Double { engine.sampleRate }
 

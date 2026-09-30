@@ -34,6 +34,37 @@ public final class TapEngine {
         leveler_set_params(state, params)
     }
 
+    private var recIn: [Float] = []
+    private var recOut: [Float] = []
+
+    /// Records the next `seconds` of raw and processed audio. Restarting the
+    /// engine (a device or process change) drops the recording.
+    public func startRecording(seconds: Double) {
+        let frames = Int(seconds * (sampleRate > 0 ? sampleRate : 48000))
+        recIn = [Float](repeating: 0, count: frames * 2)
+        recOut = [Float](repeating: 0, count: frames * 2)
+        recIn.withUnsafeMutableBufferPointer { i in
+            recOut.withUnsafeMutableBufferPointer { o in
+                leveler_record(state, i.baseAddress, o.baseAddress, UInt32(frames))
+            }
+        }
+    }
+
+    public var recordingDone: Bool {
+        !recIn.isEmpty && Int(leveler_recorded_frames(state)) * 2 >= recIn.count
+    }
+
+    public var isRecording: Bool { !recIn.isEmpty }
+
+    /// Stops recording and returns what was recorded so far as interleaved
+    /// stereo (raw, processed).
+    public func takeRecording() -> (raw: [Float], processed: [Float]) {
+        let frames = Int(leveler_recorded_frames(state))
+        leveler_record(state, nil, nil, 0)
+        defer { recIn = []; recOut = [] }
+        return (Array(recIn.prefix(frames * 2)), Array(recOut.prefix(frames * 2)))
+    }
+
     public var bypass: Bool {
         get { leveler_get_bypass(state) != 0 }
         set { leveler_set_bypass(state, newValue ? 1 : 0) }
@@ -47,6 +78,8 @@ public final class TapEngine {
             try checkFormats()
             sampleRate = try getValue(aggregateID, kAudioDevicePropertyNominalSampleRate, default: Float64(48000))
             leveler_init(state, params, Float(sampleRate))
+            recIn = []
+            recOut = []
             try check(leveler_create_ioproc(aggregateID, state, &procID), "AudioDeviceCreateIOProcID")
             try check(AudioDeviceStart(aggregateID, procID), "AudioDeviceStart")
             isRunning = true
