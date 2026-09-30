@@ -1,7 +1,7 @@
 import AVFoundation
 import CoreAudio
 import Foundation
-import LevelerDSP
+import LevelerCore
 
 let usage = """
 usage: huddle-leveler [options]
@@ -163,39 +163,18 @@ func runFile(_ inPath: String, _ outPath: String) throws {
 
 // MARK: - Live mode
 
-let ownPID = getpid()
+func isSlack(_ p: AudioProcess) -> Bool { TapTarget.slack.matches(p) }
 
-func isSlack(_ p: AudioProcess) -> Bool {
-    p.bundleID.hasPrefix("com.tinyspeck.slackmacgap") || p.path.contains("/Slack.app/")
-}
-
-func matches(_ p: AudioProcess) -> Bool {
-    if p.pid == ownPID { return false }
-    if !pids.isEmpty || appMatch != nil {
+let target: TapTarget = {
+    if pids.isEmpty && appMatch == nil { return .slack }
+    let name = !pids.isEmpty ? "pid \(pids.map(String.init).joined(separator: ","))" : appMatch!
+    return TapTarget(name: name) { p in
         if pids.contains(p.pid) { return true }
-        if let m = appMatch?.lowercased() {
-            return p.bundleID.lowercased().contains(m) || p.path.lowercased().contains(m)
-        }
-        return false
+        guard let m = appMatch?.lowercased() else { return false }
+        return p.bundleID.lowercased().contains(m) || p.path.lowercased().contains(m)
     }
-    return isSlack(p)
-}
+}()
 
-func chooseOutput() throws -> OutputDevice {
-    guard let outputMatch else { return try defaultOutputDevice() }
-    let devices = try outputDevices()
-    guard let d = devices.first(where: { $0.name.localizedCaseInsensitiveContains(outputMatch) }) else {
-        fail("no output device matching '\(outputMatch)'. Devices: \(devices.map(\.name).joined(separator: ", "))")
-    }
-    return d
-}
-
-let targetName = !pids.isEmpty ? "pid \(pids.map(String.init).joined(separator: ","))" : (appMatch ?? "Slack")
-let engine = TapEngine(params: params)
-var tapped: [AudioObjectID] = []
-var tappedOutput = ""
-var stoppedSilent = false
-var status = "starting"
 let isTTY = isatty(STDOUT_FILENO) != 0
 // Line-buffer stdout so a log file or pipe sees each line as it happens.
 setvbuf(stdout, nil, _IOLBF, 0)
@@ -205,87 +184,20 @@ func log(_ line: String) {
     print(line)
 }
 
-func reconcile() {
-    do {
-        let procs = try audioProcesses().filter(matches)
-        let ids = procs.map(\.id).sorted()
-        let output = try chooseOutput()
-        if ids == tapped && output.uid == tappedOutput && (engine.isRunning || ids.isEmpty || stoppedSilent) { return }
-        stoppedSilent = false
-        engine.stop()
-        tapped = ids
-        tappedOutput = output.uid
-        if ids.isEmpty {
-            status = "waiting for \(targetName) to use audio"
-            log("No \(targetName) audio processes yet; waiting (join a huddle).")
-            return
-        }
-        try engine.start(processes: ids, output: output)
-        tapHeardAudio = false
-        silentTicks = 0
-        let who = procs.map { "\($0.pid)" }.joined(separator: ",")
-        status = "\(targetName) → \(output.name)"
-        log("Tapping \(targetName) (\(procs.count) process\(procs.count == 1 ? "" : "es"): \(who)) → \(output.name) @ \(Int(engine.sampleRate)) Hz")
-    } catch {
-        engine.stop()
-        // Forget what we tapped so the next process or device change retries.
-        tapped = []
-        tappedOutput = ""
-        status = "error"
-        log("Could not start: \(error)")
-        if let e = error as? CoreAudioError, e.what.contains("CreateProcessTap") {
-            log("If macOS asked for permission, allow it in System Settings → Privacy & Security → Screen & System Audio Recording (\"System Audio Recording Only\"), then re-run.")
-        }
-    }
-}
-
 func meterBar(_ db: Float, width: Int = 20) -> String {
     let filled = Int(((db + 60) / 60 * Float(width)).rounded())
     let n = max(0, min(width, filled))
     return String(repeating: "█", count: n) + String(repeating: "·", count: width - n)
 }
 
-var lastFrames: UInt64 = 0
-var silentTicks = 0
-var tapHeardAudio = false
 var meterTicks = 0
 var logPeakIn: Float = -120
 var logPeakOut: Float = -120
 
-func drawMeter() {
-    let m = leveler_take_meters(engine.state)
-    guard engine.isRunning else { return }
+func drawMeter(_ m: leveler_meters, bypass: Bool) {
+    guard !quiet else { return }
     let inDB = 20 * log10(max(m.in_peak, 1e-6))
     let outDB = 20 * log10(max(m.out_peak, 1e-6))
-    // Warn once if the tap runs but delivers nothing but zeros for a while
-    // while the app reports it is playing: that is what a missing permission looks like.
-    // Only a tap that has never delivered a sample counts: once audio has come
-    // through, silence is just a quiet huddle.
-    if m.in_peak > 0 { tapHeardAudio = true }
-    if !tapHeardAudio && m.frames != lastFrames { silentTicks += 1 } else { silentTicks = 0 }
-    lastFrames = m.frames
-    if silentTicks >= 100 {
-        silentTicks = 0
-        let playing = (try? audioProcesses().filter(matches).contains(where: \.isPlaying)) ?? false
-        if playing {
-            // Either permission is missing or nobody has spoken yet; the
-            // samples can't tell which. The tap keeps the app muted, so stop
-            // tapping and let its audio play unprocessed, then try again in
-            // 30 s (or sooner on a process or device change).
-            engine.stop()
-            stoppedSilent = true
-            status = "stopped: tap was silent"
-            log("Tap received only silence for 10 s while \(targetName) was playing, so \(targetName) plays unprocessed for now; retrying in 30 s. If this repeats while people are talking, check System Settings → Privacy & Security → Screen & System Audio Recording for your terminal.")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-                guard stoppedSilent else { return }
-                stoppedSilent = false
-                tapped = []
-                reconcile()
-            }
-            return
-        }
-    }
-    guard !quiet else { return }
     if !isTTY {
         // Logging to a file or pipe: one line every two seconds while there's sound.
         meterTicks += 1
@@ -294,15 +206,15 @@ func drawMeter() {
         if meterTicks % 20 == 0 {
             if logPeakIn > -100 {
                 print(String(format: "%@ talker %.1f dB, gain %+.1f dB, peak in %.1f / out %.1f dB",
-                             engine.bypass ? "bypass" : "on", m.level_db, m.gain_db, logPeakIn, logPeakOut))
+                             bypass ? "bypass" : "on", m.level_db, m.gain_db, logPeakIn, logPeakOut))
             }
             logPeakIn = -120
             logPeakOut = -120
         }
         return
     }
-    let mode = engine.bypass ? "BYPASS" : "ON    "
-    let gain = engine.bypass ? "   --  " : String(format: "%+5.1f dB", m.gain_db)
+    let mode = bypass ? "BYPASS" : "ON    "
+    let gain = bypass ? "   --  " : String(format: "%+5.1f dB", m.gain_db)
     let line = String(format: "\r\u{1B}[K[%@] in %@ %6.1f  gain %@  out %@ %6.1f",
                       mode, meterBar(inDB), inDB, gain, meterBar(outDB), outDB)
     FileHandle.standardOutput.write(line.data(using: .utf8)!)
@@ -311,30 +223,21 @@ func drawMeter() {
 var keepAlive: [Any] = []
 
 func runLive() {
-    let queue = DispatchQueue.main
-    var pending: DispatchWorkItem?
-    func scheduleReconcile() {
-        pending?.cancel()
-        let item = DispatchWorkItem { reconcile() }
-        pending = item
-        queue.asyncAfter(deadline: .now() + 0.3, execute: item)
-    }
-    let listeners = [
-        SystemListener(kAudioHardwarePropertyProcessObjectList, queue: queue, handler: scheduleReconcile),
-        SystemListener(kAudioHardwarePropertyDefaultOutputDevice, queue: queue, handler: scheduleReconcile),
-        SystemListener(kAudioHardwarePropertyDevices, queue: queue, handler: scheduleReconcile),
-    ]
+    let controller = LevelerController(target: target, params: params)
+    controller.outputNameMatch = outputMatch
+    controller.onLog = log
+    controller.onMeters = { [unowned controller] m in drawMeter(m, bypass: controller.bypass) }
 
     func shutdown() {
-        engine.stop()
+        controller.deactivate()
         if isTTY && !quiet { print("") }
-        print("Stopped; \(targetName) audio is back to normal.")
+        print("Stopped; \(target.name) audio is back to normal.")
         exit(0)
     }
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
     let signals = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
-        let s = DispatchSource.makeSignalSource(signal: sig, queue: queue)
+        let s = DispatchSource.makeSignalSource(signal: sig, queue: .main)
         s.setEventHandler(handler: shutdown)
         s.resume()
         return s
@@ -345,21 +248,16 @@ func runLive() {
             let cmd = line.trimmingCharacters(in: .whitespaces).lowercased()
             DispatchQueue.main.async {
                 if cmd == "q" || cmd == "quit" { shutdown() }
-                engine.bypass.toggle()
-                log(engine.bypass ? "Bypass: hearing \(targetName) unprocessed." : "Compressor on.")
+                controller.bypass.toggle()
+                log(controller.bypass ? "Bypass: hearing \(target.name) unprocessed." : "Leveling on.")
             }
         }
     }
 
-    let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
-    timer.setEventHandler(handler: drawMeter)
-    timer.resume()
-
-    reconcile()
+    controller.activate()
     // A global keeps these alive; withExtendedLifetime around dispatchMain()
     // doesn't survive optimization, which silently dropped the signal handlers.
-    keepAlive = [listeners, signals, timer]
+    keepAlive = [controller, signals]
     dispatchMain()
 }
 

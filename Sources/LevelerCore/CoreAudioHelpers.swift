@@ -1,10 +1,10 @@
 import CoreAudio
 import Foundation
 
-struct CoreAudioError: Error, CustomStringConvertible {
-    let what: String
-    let status: OSStatus
-    var description: String {
+public struct CoreAudioError: Error, CustomStringConvertible {
+    public let what: String
+    public let status: OSStatus
+    public var description: String {
         let be = UInt32(bitPattern: status).bigEndian
         let bytes = withUnsafeBytes(of: be) { Array($0) }
         let fourcc = bytes.allSatisfy { $0 >= 32 && $0 < 127 } ? " '\(String(bytes: bytes, encoding: .ascii)!)'" : ""
@@ -54,14 +54,14 @@ func getString(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector,
 
 // MARK: - Processes
 
-struct AudioProcess {
-    let id: AudioObjectID
-    let pid: pid_t
-    let bundleID: String
-    let path: String
-    let isPlaying: Bool
+public struct AudioProcess {
+    public let id: AudioObjectID
+    public let pid: pid_t
+    public let bundleID: String
+    public let path: String
+    public let isPlaying: Bool
 
-    var displayName: String {
+    public var displayName: String {
         if !bundleID.isEmpty { return bundleID }
         return (path as NSString).lastPathComponent
     }
@@ -73,7 +73,7 @@ func executablePath(of pid: pid_t) -> String {
     return n > 0 ? String(cString: buf) : ""
 }
 
-func audioProcesses() throws -> [AudioProcess] {
+public func audioProcesses() throws -> [AudioProcess] {
     let ids = try getArray(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyProcessObjectList,
                            of: AudioObjectID.self)
     return ids.compactMap { id in
@@ -86,13 +86,13 @@ func audioProcesses() throws -> [AudioProcess] {
 
 // MARK: - Devices
 
-struct OutputDevice {
-    let id: AudioObjectID
-    let uid: String
-    let name: String
+public struct OutputDevice: Hashable {
+    public let id: AudioObjectID
+    public let uid: String
+    public let name: String
 }
 
-func outputDevices() throws -> [OutputDevice] {
+public func outputDevices() throws -> [OutputDevice] {
     let ids = try getArray(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDevices, of: AudioObjectID.self)
     return ids.compactMap { id in
         guard let streams = try? getArray(id, kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput,
@@ -103,7 +103,7 @@ func outputDevices() throws -> [OutputDevice] {
     }
 }
 
-func defaultOutputDevice() throws -> OutputDevice {
+public func defaultOutputDevice() throws -> OutputDevice {
     let id = try getValue(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultOutputDevice,
                           default: AudioObjectID(kAudioObjectUnknown))
     return OutputDevice(id: id, uid: try getString(id, kAudioDevicePropertyDeviceUID),

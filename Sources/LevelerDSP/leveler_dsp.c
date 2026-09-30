@@ -7,6 +7,7 @@
 
 struct leveler_state {
     leveler_params p;
+    float sample_rate;
     float rms_coef, attack_coef, release_coef, limiter_release_coef;
     float speech_up_coef, speech_down_coef, speech_fresh_coef, boost_up_coef, peak_release_coef;
     unsigned pause_frames, fresh_frames;  // turn-taking: silence so far, fast-tracking left
@@ -84,16 +85,24 @@ leveler_meters leveler_take_meters(leveler_state *s) {
     return m;
 }
 
-void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
-    int bypass = atomic_load(&s->bypass);
-    memset(s, 0, sizeof(*s));
-    atomic_store(&s->bypass, bypass);
+static void apply_params(leveler_state *s, leveler_params p) {
     if (p.ratio < 1.0f) p.ratio = 1.0f;
     if (p.level_ratio < 1.0f) p.level_ratio = 1.0f;
     if (p.max_boost_db < 0.0f) p.max_boost_db = 0.0f;
     if (p.max_cut_db < 0.0f) p.max_cut_db = 0.0f;
     if (p.knee_db < 0.0f) p.knee_db = 0.0f;
+    if (p.soften_db < 0.0f) p.soften_db = 0.0f;
     s->p = p;
+    s->attack_coef = coef_for_ms(p.attack_ms, s->sample_rate);
+    s->release_coef = coef_for_ms(p.release_ms, s->sample_rate);
+}
+
+void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
+    int bypass = atomic_load(&s->bypass);
+    memset(s, 0, sizeof(*s));
+    atomic_store(&s->bypass, bypass);
+    s->sample_rate = sample_rate;
+    apply_params(s, p);
     s->rms_coef = coef_for_ms(50.0f, sample_rate);
     s->speech_up_coef = coef_for_ms(100.0f, sample_rate);
     s->speech_down_coef = coef_for_ms(1500.0f, sample_rate);
@@ -102,15 +111,14 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     s->fresh_window_frames = (unsigned)(0.5f * sample_rate);
     s->boost_up_coef = coef_for_ms(50.0f, sample_rate);
     s->peak_release_coef = coef_for_ms(100.0f, sample_rate);
-    s->speech_db = p.target_db;  // no gain change until someone has spoken
-    s->attack_coef = coef_for_ms(p.attack_ms, sample_rate);
-    s->release_coef = coef_for_ms(p.release_ms, sample_rate);
+    s->speech_db = s->p.target_db;  // no gain change until someone has spoken
     s->limiter_release_coef = coef_for_ms(50.0f, sample_rate);
     s->limiter_gain = 1.0f;
     s->soften_coef = 1.0f - expf(-2.0f * 3.14159265f * 2500.0f / sample_rate);
-    if (p.soften_db < 0.0f) s->p.soften_db = 0.0f;
     atomic_store(&s->meter_level_db, -120.0f);
 }
+
+void leveler_set_params(leveler_state *s, leveler_params p) { apply_params(s, p); }
 
 // Downward compression plus makeup for a signal at level_db.
 static float downward_gain_db(const leveler_params *p, float level_db) {

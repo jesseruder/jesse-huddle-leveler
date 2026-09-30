@@ -9,16 +9,16 @@ import LevelerDSP
 /// a single IOProc receives the tapped audio as input and writes the device's
 /// output in the same callback. Because the tap uses `.mutedWhenTapped`, the
 /// apps' original audio comes back on its own if this process dies.
-final class TapEngine {
-    let state: OpaquePointer
-    private let params: leveler_params
+public final class TapEngine {
+    public let state: OpaquePointer
+    private var params: leveler_params
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
-    private(set) var sampleRate: Double = 0
-    private(set) var isRunning = false
+    public private(set) var sampleRate: Double = 0
+    public private(set) var isRunning = false
 
-    init(params: leveler_params) {
+    public init(params: leveler_params) {
         self.params = params
         state = leveler_create()
     }
@@ -28,12 +28,18 @@ final class TapEngine {
         leveler_destroy(state)
     }
 
-    var bypass: Bool {
+    /// Changes settings without interrupting audio.
+    public func update(params: leveler_params) {
+        self.params = params
+        leveler_set_params(state, params)
+    }
+
+    public var bypass: Bool {
         get { leveler_get_bypass(state) != 0 }
         set { leveler_set_bypass(state, newValue ? 1 : 0) }
     }
 
-    func start(processes: [AudioObjectID], output: OutputDevice) throws {
+    public func start(processes: [AudioObjectID], output: OutputDevice) throws {
         guard stop() else { throw TeardownFailed() }
         do {
             try createTap(processes: processes)
@@ -53,7 +59,7 @@ final class TapEngine {
     /// Tears everything down. An object whose destroy call fails keeps its ID
     /// so the next stop() retries it; start() refuses to run until it's gone.
     @discardableResult
-    func stop() -> Bool {
+    public func stop() -> Bool {
         isRunning = false
         if let procID {
             AudioDeviceStop(aggregateID, procID)

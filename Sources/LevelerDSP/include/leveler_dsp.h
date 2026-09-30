@@ -43,6 +43,10 @@ leveler_state *leveler_create(void);
 void leveler_destroy(leveler_state *s);
 // Resets all state for a new stream. Keeps the bypass setting.
 void leveler_init(leveler_state *s, leveler_params p, float sample_rate);
+// Changes settings on a running stream without resetting its state. Safe to
+// call while the audio thread is processing: the worst case is one buffer
+// with a mix of old and new values.
+void leveler_set_params(leveler_state *s, leveler_params p);
 void leveler_set_bypass(leveler_state *s, int bypass);
 int leveler_get_bypass(leveler_state *s);
 // Returns the meters and resets the peaks.
