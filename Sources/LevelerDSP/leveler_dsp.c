@@ -30,6 +30,27 @@ typedef struct {
     unsigned pos;
 } limiter;
 
+// Talker lookahead: the leveling gain is worked out LOOKAHEAD_MS ahead of
+// the audio it's applied to, in blocks of LA_BLOCK samples. Each block's gain
+// is the lowest gain wanted anywhere from that block to the end of the
+// lookahead, averaged over the lookahead, so a loud talker is already being
+// turned down when their first syllable plays.
+#define LOOKAHEAD_MS 24.0f
+enum { LA_BLOCK = 32, LA_MAX_BLOCKS = 80, LA_RING = 4096 };
+
+typedef struct {
+    float dl[LA_RING], dr[LA_RING];  // delayed audio
+    float want[LA_MAX_BLOCKS + 1];   // lowest gain wanted in each recent block, dB
+    float held[LA_MAX_BLOCKS];       // window minimums, for the running average
+    float sum;
+    unsigned blocks;                 // lookahead in blocks
+    unsigned pos;                    // samples written
+    unsigned block_count;            // blocks completed
+    unsigned in_block;               // samples into the current block
+    float block_min;                 // lowest gain wanted so far in this block
+    float cur_db, step_db;           // applied gain, ramped per sample
+} lookahead;
+
 struct leveler_state {
     leveler_params p;      // in use by the audio thread
     // Settings handoff: leveler_set_params publishes a heap copy in mailbox;
@@ -39,6 +60,8 @@ struct leveler_state {
     _Atomic(leveler_params *) retired;
     leveler_params *retire_later;
     declipper dc;
+    lookahead la;
+    float short_ms, short_coef;  // 10 ms mean square, for the onset guard
     limiter lim;
     float sample_rate;
     float rms_coef, attack_coef, release_coef, limiter_release_coef;
@@ -161,6 +184,12 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     for (unsigned i = 0; i < LIM_RING; i++) s->lim.need[i] = 1.0f;
     for (unsigned i = 0; i < LIM_AHEAD; i++) s->lim.held[i] = 1.0f;
     s->lim.sum = (float)LIM_AHEAD;
+    s->short_coef = coef_for_ms(10.0f, sample_rate);
+    unsigned blocks = (unsigned)(LOOKAHEAD_MS * 0.001f * sample_rate / LA_BLOCK + 0.5f);
+    if (blocks < 1) blocks = 1;
+    if (blocks > LA_MAX_BLOCKS) blocks = LA_MAX_BLOCKS;
+    s->la.blocks = blocks;
+    s->la.block_min = 100.0f;
     s->soften_coef = 1.0f - expf(-2.0f * 3.14159265f * 2500.0f / sample_rate);
     atomic_store(&s->meter_level_db, -120.0f);
 }
@@ -340,7 +369,45 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
         // room noise between words isn't raised.
         float applied = boost_db;
         if (applied > 0.0f) applied *= clamp_f((level_db - (p->gate_db - 6.0f)) / 12.0f, 0.0f, 1.0f);
-        gain_db = downward_gain_db(p, 10.0f * log10f(env + 1e-12f)) + applied;
+        float want_db = downward_gain_db(p, 10.0f * log10f(env + 1e-12f)) + applied;
+
+        // Onset guard: with leveling on, a sudden loud talker is turned down
+        // at once so their short-term level stays within 12 dB of the target,
+        // without waiting for the talker level to catch up.
+        s->short_ms = s->short_coef * s->short_ms + (1.0f - s->short_coef) * x * x;
+        if (p->level_ratio > 1.0f) {
+            float guard = p->target_db + 12.0f - 10.0f * log10f(s->short_ms + 1e-12f);
+            if (guard < 0.0f && want_db > guard) want_db = guard;
+        }
+
+        // Apply it through the lookahead.
+        lookahead *la = &s->la;
+        la->dl[la->pos % LA_RING] = l;
+        la->dr[la->pos % LA_RING] = r;
+        l = la->dl[(la->pos - la->blocks * LA_BLOCK) % LA_RING];
+        r = la->dr[(la->pos - la->blocks * LA_BLOCK) % LA_RING];
+        la->pos++;
+        if (want_db < la->block_min) la->block_min = want_db;
+        if (++la->in_block == LA_BLOCK) {
+            unsigned nb = la->blocks;
+            la->want[la->block_count % (nb + 1)] = la->block_min;
+            la->block_min = 100.0f;
+            la->in_block = 0;
+            float window_min = 100.0f;
+            for (unsigned j = 0; j <= nb; j++)
+                if (la->want[j] < window_min) window_min = la->want[j];
+            unsigned h = la->block_count % nb;
+            la->sum += window_min - la->held[h];
+            la->held[h] = window_min;
+            if (h == 0) {
+                la->sum = 0.0f;
+                for (unsigned j = 0; j < nb; j++) la->sum += la->held[j];
+            }
+            la->block_count++;
+            la->step_db = (la->sum / (float)nb - la->cur_db) / (float)LA_BLOCK;
+        }
+        la->cur_db += la->step_db;
+        gain_db = la->cur_db;
 
         float g = db_to_lin(gain_db);
         l *= g;
@@ -349,8 +416,8 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
         // Soften loud talkers: split at ~2.5 kHz and turn the top down.
         lp_l += s->soften_coef * (l - lp_l);
         lp_r += s->soften_coef * (r - lp_r);
-        if (p->soften_db > 0.0f && boost_db < 0.0f) {
-            float amount = clamp_f(-boost_db / 5.0f, 0.0f, 1.0f);
+        if (p->soften_db > 0.0f && gain_db < 0.0f) {
+            float amount = clamp_f(-gain_db / 5.0f, 0.0f, 1.0f);
             float treble = db_to_lin(-p->soften_db * amount);
             l = lp_l + treble * (l - lp_l);
             r = lp_r + treble * (r - lp_r);
@@ -404,6 +471,8 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     s->speech_db = speech_db;
     s->boost_db = boost_db;
     s->limiter_gain = lim;
+    if (!isfinite(s->short_ms)) s->short_ms = 0.0f;
+    if (!isfinite(s->la.cur_db)) { s->la.cur_db = 0.0f; s->la.step_db = 0.0f; }
     s->lp_l = isfinite(lp_l) ? lp_l : 0.0f;
     s->lp_r = isfinite(lp_r) ? lp_r : 0.0f;
     if (in_peak > atomic_load(&s->meter_in_peak)) atomic_store(&s->meter_in_peak, in_peak);

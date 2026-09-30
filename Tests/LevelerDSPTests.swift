@@ -137,8 +137,8 @@ final class LevelerDSPTests: XCTestCase {
             buf[2 * i + 1] = v
         }
         buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, UInt32(n), 2) }
-        // 0.7 s into the quiet talker it should be raised, not still cut.
-        let from = quietStart + Int(rate * 0.7), to = from + Int(rate / 10)
+        // 0.8 s into the quiet talker it should be raised, not still cut.
+        let from = quietStart + Int(rate * 0.8), to = from + Int(rate / 10)
         let peak = buf[(2 * from)..<(2 * to)].map(abs).max()!
         XCTAssertGreaterThan(peak, 0.02)
     }
@@ -171,12 +171,33 @@ final class LevelerDSPTests: XCTestCase {
             let s = leveler_create()!
             defer { leveler_destroy(s) }
             leveler_init(s, p, rate)
-            var buf = [Float](repeating: 0, count: 2048)
+            var buf = [Float](repeating: 0, count: 8192)
             buf[200] = 0.5; buf[201] = 0.5
-            buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, 1024, 2) }
+            buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, 4096, 2) }
             return buf.firstIndex(where: { abs($0) > 0.1 })! / 2
         }
         XCTAssertEqual(impulseAt(declip: 1), impulseAt(declip: 0))
+    }
+
+    func testLoudTalkerIsAlreadyTurnedDownWhenTheyStart() {
+        // A quiet talker, a 1 s pause, then a loud one: the loud talker's first
+        // 20 ms should already come out well below how they went in.
+        let s = leveler_create()!
+        defer { leveler_destroy(s) }
+        leveler_init(s, leveler_default_params(), rate)
+        let quietEnd = Int(rate) * 3, loudStart = quietEnd + Int(rate), n = loudStart + Int(rate)
+        var buf = [Float](repeating: 0, count: n * 2)
+        for i in 0..<n {
+            let amp: Float = i < quietEnd ? 0.02 : (i < loudStart ? 0 : 0.7)
+            let v = amp * sinf(2 * .pi * 220 * Float(i) / rate)
+            buf[2 * i] = v
+            buf[2 * i + 1] = v
+        }
+        buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, UInt32(n), 2) }
+        // Find where the loud talker starts in the output (after the delay).
+        let first = (loudStart..<n).first(where: { abs(buf[2 * $0]) > 0.01 })!
+        let head = buf[(2 * first)..<(2 * (first + Int(rate / 50)))].map(abs).max()!
+        XCTAssertLessThan(20 * log10f(head / 0.7), -3)
     }
 
     func testCeilingHolds() {
