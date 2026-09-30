@@ -37,6 +37,8 @@ final class AppModel: ObservableObject {
     @Published var loudness: Double { didSet { saveParams() } }
     /// Treble cut for loud talkers, dB.
     @Published var soften: Double { didSet { saveParams() } }
+    /// Redraw peaks flattened by a clipping mic.
+    @Published var repairClipping: Bool { didSet { saveParams() } }
     /// Output device UID, or "" for the system default.
     @Published var outputUID: String {
         didSet {
@@ -64,12 +66,14 @@ final class AppModel: ObservableObject {
             "evenness": Double(p.level_ratio),
             "loudness": Double(p.target_db),
             "soften": Double(p.soften_db),
+            "repairClipping": p.declip != 0,
             "outputUID": "",
         ])
         enabled = d.bool(forKey: "enabled")
         evenness = d.double(forKey: "evenness")
         loudness = d.double(forKey: "loudness")
         soften = d.double(forKey: "soften")
+        repairClipping = d.bool(forKey: "repairClipping")
         outputUID = d.string(forKey: "outputUID") ?? ""
         launchAtLogin = SMAppService.mainApp.status == .enabled
 
@@ -123,6 +127,7 @@ final class AppModel: ObservableObject {
         evenness = Double(p.level_ratio)
         loudness = Double(p.target_db)
         soften = Double(p.soften_db)
+        repairClipping = p.declip != 0
     }
 
     private func currentParams() -> leveler_params {
@@ -130,6 +135,7 @@ final class AppModel: ObservableObject {
         p.level_ratio = Float(evenness)
         p.target_db = Float(loudness)
         p.soften_db = Float(soften)
+        p.declip = repairClipping ? 1 : 0
         return p
     }
 
@@ -137,6 +143,7 @@ final class AppModel: ObservableObject {
         defaults.set(evenness, forKey: "evenness")
         defaults.set(loudness, forKey: "loudness")
         defaults.set(soften, forKey: "soften")
+        defaults.set(repairClipping, forKey: "repairClipping")
         controller.params = currentParams()
     }
 
@@ -189,6 +196,9 @@ struct MenuView: View {
             SettingSlider(title: "Soften loud voices", value: $model.soften, range: 0...15,
                           label: model.soften < 0.5 ? "Off" : String(format: "%.0f dB", model.soften),
                           low: "Off", high: "Strong")
+
+            Toggle("Repair clipped peaks", isOn: $model.repairClipping)
+                .help("Redraws peaks flattened by a mic that's turned up too far")
 
             Picker("Output", selection: $model.outputUID) {
                 Text("System default").tag("")
