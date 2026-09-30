@@ -32,9 +32,12 @@ typedef struct {
 
 struct leveler_state {
     leveler_params p;      // in use by the audio thread
-    leveler_params pending;  // written by leveler_set_params, guarded by pending_seq
-    atomic_uint pending_seq;  // odd while pending is being written
-    unsigned applied_seq;
+    // Settings handoff: leveler_set_params publishes a heap copy in mailbox;
+    // the audio thread takes it whole and hands it back through retired for
+    // the main thread to free (held in retire_later if retired is full).
+    _Atomic(leveler_params *) mailbox;
+    _Atomic(leveler_params *) retired;
+    leveler_params *retire_later;
     declipper dc;
     limiter lim;
     float sample_rate;
@@ -51,7 +54,8 @@ struct leveler_state {
     float soften_coef;   // one-pole low-pass coefficient for the treble cut
     float lp_l, lp_r;    // low-pass state for the treble cut
     atomic_int bypass;   // pass audio through untouched
-    float *rec_in, *rec_out;
+    _Atomic(float *) rec_in;
+    _Atomic(float *) rec_out;
     atomic_uint rec_cap, rec_pos;
 
     // Meters, written by the audio thread and read (and reset) by the UI.
@@ -96,13 +100,19 @@ leveler_params leveler_default_params(void) {
     return p;
 }
 
+static void free_params_handoff(leveler_state *s);
+
 leveler_state *leveler_create(void) {
     leveler_state *s = calloc(1, sizeof(leveler_state));
     if (s) leveler_init(s, leveler_default_params(), 48000.0f);
     return s;
 }
 
-void leveler_destroy(leveler_state *s) { free(s); }
+void leveler_destroy(leveler_state *s) {
+    if (!s) return;
+    free_params_handoff(s);
+    free(s);
+}
 
 void leveler_set_bypass(leveler_state *s, int bypass) { atomic_store(&s->bypass, bypass ? 1 : 0); }
 int leveler_get_bypass(leveler_state *s) { return atomic_load(&s->bypass); }
@@ -132,6 +142,7 @@ static void apply_params(leveler_state *s, leveler_params p) {
 
 void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     int bypass = atomic_load(&s->bypass);
+    free_params_handoff(s);
     memset(s, 0, sizeof(*s));
     atomic_store(&s->bypass, bypass);
     s->sample_rate = sample_rate;
@@ -154,26 +165,35 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     atomic_store(&s->meter_level_db, -120.0f);
 }
 
-// Settings reach the audio thread through a sequence lock: the writer makes
-// the sequence odd while it copies, and the audio thread takes the copy at
-// the start of a buffer only if the sequence was even and unchanged across
-// its read, so it never runs on a half-written set.
+// Main thread. Frees what the audio thread has finished with, then
+// publishes the new settings; a copy the audio thread never took is freed.
 void leveler_set_params(leveler_state *s, leveler_params p) {
-    unsigned seq = atomic_load_explicit(&s->pending_seq, memory_order_relaxed);
-    atomic_store_explicit(&s->pending_seq, seq + 1, memory_order_relaxed);
-    atomic_thread_fence(memory_order_release);
-    s->pending = p;
-    atomic_store_explicit(&s->pending_seq, seq + 2, memory_order_release);
+    free(atomic_exchange(&s->retired, NULL));
+    leveler_params *copy = malloc(sizeof(*copy));
+    if (!copy) return;
+    *copy = p;
+    free(atomic_exchange(&s->mailbox, copy));
 }
 
+// Audio thread, at the start of a buffer: never allocates or frees.
 static void take_pending_params(leveler_state *s) {
-    unsigned seq = atomic_load_explicit(&s->pending_seq, memory_order_acquire);
-    if (seq == s->applied_seq || (seq & 1)) return;
-    leveler_params p = s->pending;
-    atomic_thread_fence(memory_order_acquire);
-    if (atomic_load_explicit(&s->pending_seq, memory_order_relaxed) != seq) return;  // try next buffer
-    apply_params(s, p);
-    s->applied_seq = seq;
+    if (s->retire_later) {
+        leveler_params *expected = NULL;
+        if (atomic_compare_exchange_strong(&s->retired, &expected, s->retire_later)) s->retire_later = NULL;
+    }
+    if (s->retire_later) return;  // main thread hasn't collected yet; try next buffer
+    leveler_params *p = atomic_exchange(&s->mailbox, NULL);
+    if (!p) return;
+    apply_params(s, *p);
+    leveler_params *expected = NULL;
+    if (!atomic_compare_exchange_strong(&s->retired, &expected, p)) s->retire_later = p;
+}
+
+static void free_params_handoff(leveler_state *s) {
+    free(atomic_exchange(&s->mailbox, NULL));
+    free(atomic_exchange(&s->retired, NULL));
+    free(s->retire_later);
+    s->retire_later = NULL;
 }
 
 // Downward compression plus makeup for a signal at level_db.
@@ -394,18 +414,18 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
 
 void leveler_record(leveler_state *s, float *in_buf, float *out_buf, unsigned frames) {
     atomic_store(&s->rec_cap, 0);
-    s->rec_in = in_buf;
-    s->rec_out = out_buf;
+    atomic_store(&s->rec_in, in_buf);
+    atomic_store(&s->rec_out, out_buf);
     atomic_store(&s->rec_pos, 0);
     atomic_store(&s->rec_cap, frames);
 }
 
 unsigned leveler_recorded_frames(leveler_state *s) { return atomic_load(&s->rec_pos); }
 
-static void record(leveler_state *s, float *const *slot, const float *stereo, unsigned frames, unsigned pos) {
+static void record(leveler_state *s, _Atomic(float *) *slot, const float *stereo, unsigned frames, unsigned pos) {
     unsigned cap = atomic_load(&s->rec_cap);
     if (pos >= cap) return;
-    float *buf = *slot;
+    float *buf = atomic_load(slot);
     if (!buf) return;
     unsigned n = cap - pos < frames ? cap - pos : frames;
     memcpy(buf + 2 * (size_t)pos, stereo, 2 * n * sizeof(float));
