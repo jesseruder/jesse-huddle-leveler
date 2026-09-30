@@ -15,6 +15,8 @@ struct leveler_state {
     float speech_db;     // running estimate of the current talker's level
     float boost_db;      // upward gain being applied
     float limiter_gain;  // current limiter gain (linear, <= 1)
+    float soften_coef;   // one-pole low-pass coefficient for the treble cut
+    float lp_l, lp_r;    // low-pass state for the treble cut
     atomic_int bypass;   // pass audio through untouched
 
     // Meters, written by the audio thread and read (and reset) by the UI.
@@ -37,13 +39,14 @@ static inline float coef_for_ms(float ms, float sample_rate) {
 }
 
 leveler_params leveler_default_params(void) {
-    // Slack huddle audio already peaks near full scale, and squashing loud
-    // voices is audible, so by default only quiet voices are raised: a voice
-    // 12 dB under the target comes up 8 dB, and loud voices pass untouched.
+    // Fast compression of Slack's already hot audio is audible, so the default
+    // levels whole talkers with a slow gain instead: a talker 12 dB off the
+    // target moves 8 dB toward it. Fast downward compression is off.
     leveler_params p = {
-        .boost_below_db = -24.0f,
-        .boost_ratio = 3.0f,
+        .target_db = -24.0f,
+        .level_ratio = 3.0f,
         .max_boost_db = 12.0f,
+        .max_cut_db = 15.0f,
         .threshold_db = -20.0f,
         .ratio = 1.0f,
         .knee_db = 10.0f,
@@ -52,6 +55,7 @@ leveler_params leveler_default_params(void) {
         .makeup_db = 0.0f,
         .gate_db = -55.0f,
         .ceiling_db = -0.5f,
+        .soften_db = 6.0f,
     };
     return p;
 }
@@ -83,8 +87,9 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     memset(s, 0, sizeof(*s));
     atomic_store(&s->bypass, bypass);
     if (p.ratio < 1.0f) p.ratio = 1.0f;
-    if (p.boost_ratio < 1.0f) p.boost_ratio = 1.0f;
+    if (p.level_ratio < 1.0f) p.level_ratio = 1.0f;
     if (p.max_boost_db < 0.0f) p.max_boost_db = 0.0f;
+    if (p.max_cut_db < 0.0f) p.max_cut_db = 0.0f;
     if (p.knee_db < 0.0f) p.knee_db = 0.0f;
     s->p = p;
     s->rms_coef = coef_for_ms(50.0f, sample_rate);
@@ -92,11 +97,13 @@ void leveler_init(leveler_state *s, leveler_params p, float sample_rate) {
     s->speech_down_coef = coef_for_ms(1500.0f, sample_rate);
     s->boost_up_coef = coef_for_ms(50.0f, sample_rate);
     s->peak_release_coef = coef_for_ms(100.0f, sample_rate);
-    s->speech_db = p.boost_below_db;  // no boost until someone has spoken
+    s->speech_db = p.target_db;  // no gain change until someone has spoken
     s->attack_coef = coef_for_ms(p.attack_ms, sample_rate);
     s->release_coef = coef_for_ms(p.release_ms, sample_rate);
     s->limiter_release_coef = coef_for_ms(50.0f, sample_rate);
     s->limiter_gain = 1.0f;
+    s->soften_coef = 1.0f - expf(-2.0f * 3.14159265f * 3000.0f / sample_rate);
+    if (p.soften_db < 0.0f) s->p.soften_db = 0.0f;
     atomic_store(&s->meter_level_db, -120.0f);
 }
 
@@ -119,15 +126,14 @@ static float downward_gain_db(const leveler_params *p, float level_db) {
     return gain + p->makeup_db * weight;
 }
 
-// Upward gain for a talker whose speech level is speech_db.
-static float boost_for_speech_db(const leveler_params *p, float speech_db) {
-    if (p->boost_ratio <= 1.0f || speech_db >= p->boost_below_db) return 0.0f;
-    float boost = (p->boost_below_db - speech_db) * (1.0f - 1.0f / p->boost_ratio);
-    return boost > p->max_boost_db ? p->max_boost_db : boost;
+// Leveling gain for a talker whose speech level is speech_db.
+static float gain_for_speech_db(const leveler_params *p, float speech_db) {
+    float gain = (p->target_db - speech_db) * (1.0f - 1.0f / p->level_ratio);
+    return clamp_f(gain, -p->max_cut_db, p->max_boost_db);
 }
 
 float leveler_static_gain_db(const leveler_params *p, float level_db) {
-    float boost = level_db >= p->gate_db ? boost_for_speech_db(p, level_db) : 0.0f;
+    float boost = level_db >= p->gate_db ? gain_for_speech_db(p, level_db) : 0.0f;
     return downward_gain_db(p, level_db) + boost;
 }
 
@@ -137,6 +143,7 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     float env = s->env, ms = s->ms, peak_env = s->peak_env;
     float speech_db = s->speech_db, boost_db = s->boost_db;
     float lim = s->limiter_gain;
+    float lp_l = s->lp_l, lp_r = s->lp_r;
     const float ceiling = db_to_lin(p->ceiling_db);
     float in_peak = 0.0f, out_peak = 0.0f;
     float level_db = -120.0f, gain_db = 0.0f;
@@ -150,31 +157,45 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
         peak_env = x > peak_env ? x : peak_env * s->peak_release_coef;
         level_db = 10.0f * log10f(ms + 1e-12f);
 
-        // Raising quiet voices. Track the talker's level only while someone
-        // is talking, so pauses hold the gain instead of ramping it up, and
-        // move toward a new talker over a second or so.
+        // Talker leveling. Track the talker's level only while someone is
+        // talking, so pauses hold the gain, and follow a louder talker within
+        // ~100 ms and a quieter one over ~1.5 s.
         if (level_db > p->gate_db) {
             float c = level_db > speech_db ? s->speech_up_coef : s->speech_down_coef;
             speech_db = c * speech_db + (1.0f - c) * level_db;
         }
-        float target = boost_for_speech_db(p, speech_db);
+        float target = gain_for_speech_db(p, speech_db);
         boost_db = s->boost_up_coef * boost_db + (1.0f - s->boost_up_coef) * target;
         if (boost_db > target) boost_db = target;
-        // The boost never pushes a peak above boost_below + 14 dB (a speech
-        // crest factor), so a loud onset right after a quiet talker drops it
-        // on the spot instead of being boosted into the limiter.
-        float allowed = p->boost_below_db + 14.0f - 20.0f * log10f(peak_env + 1e-9f);
+        // A boost never pushes a peak above target + 14 dB (a speech crest
+        // factor), so a loud onset right after a quiet talker drops it on the
+        // spot instead of being boosted into the limiter. Cuts are unaffected.
+        float allowed = p->target_db + 14.0f - 20.0f * log10f(peak_env + 1e-9f);
         if (allowed < 0.0f) allowed = 0.0f;
         if (boost_db > allowed) boost_db = allowed;
 
         // Taming loud voices (off unless ratio > 1 or makeup is set).
         float c = ms > env ? s->attack_coef : s->release_coef;
         env = c * env + (1.0f - c) * ms;
-        gain_db = downward_gain_db(p, 10.0f * log10f(env + 1e-12f)) + boost_db;
+        // Hold a cut through pauses, but fade a boost out below the gate so
+        // room noise between words isn't raised.
+        float applied = boost_db;
+        if (applied > 0.0f) applied *= clamp_f((level_db - (p->gate_db - 6.0f)) / 12.0f, 0.0f, 1.0f);
+        gain_db = downward_gain_db(p, 10.0f * log10f(env + 1e-12f)) + applied;
 
         float g = db_to_lin(gain_db);
         l *= g;
         r *= g;
+
+        // Soften loud talkers: split at ~3 kHz and turn the top down.
+        lp_l += s->soften_coef * (l - lp_l);
+        lp_r += s->soften_coef * (r - lp_r);
+        if (p->soften_db > 0.0f && boost_db < 0.0f) {
+            float amount = clamp_f(-boost_db / 8.0f, 0.0f, 1.0f);
+            float treble = db_to_lin(-p->soften_db * amount);
+            l = lp_l + treble * (l - lp_l);
+            r = lp_r + treble * (r - lp_r);
+        }
 
         // Peak limiter: recover over ~50 ms, but never past what keeps this
         // sample under the ceiling.
@@ -192,7 +213,7 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     if (!isfinite(env)) env = 0.0f;
     if (!isfinite(ms)) ms = 0.0f;
     if (!isfinite(peak_env)) peak_env = 0.0f;
-    if (!isfinite(speech_db)) speech_db = p->boost_below_db;
+    if (!isfinite(speech_db)) speech_db = p->target_db;
     if (!isfinite(boost_db)) boost_db = 0.0f;
     s->env = env;
     s->ms = ms;
@@ -200,6 +221,8 @@ static void process_stereo(leveler_state *s, float *buf, unsigned frames) {
     s->speech_db = speech_db;
     s->boost_db = boost_db;
     s->limiter_gain = lim;
+    s->lp_l = isfinite(lp_l) ? lp_l : 0.0f;
+    s->lp_r = isfinite(lp_r) ? lp_r : 0.0f;
     if (in_peak > atomic_load(&s->meter_in_peak)) atomic_store(&s->meter_in_peak, in_peak);
     if (out_peak > atomic_load(&s->meter_out_peak)) atomic_store(&s->meter_out_peak, out_peak);
     atomic_store(&s->meter_level_db, speech_db);

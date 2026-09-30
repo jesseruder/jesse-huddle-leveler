@@ -28,12 +28,12 @@ final class LevelerDSPTests: XCTestCase {
         return 10 * log10f(ms)
     }
 
-    func testQuietVoiceIsRaisedAndLoudVoiceLeftAlone() {
-        // Sine RMS is 3 dB under its peak.
-        // The gain settles on a new talker over a few seconds.
-        let loud = outputRMS(inputDB: -6, seconds: 10)
+    func testTalkersMoveTowardTarget() {
+        // Sine RMS is 3 dB under its peak. The gain settles on a new talker
+        // over a few seconds.
+        let loud = outputRMS(inputDB: -9, seconds: 10)
         let quiet = outputRMS(inputDB: -33, seconds: 10)
-        XCTAssertEqual(loud, -9, accuracy: 0.1, "loud voice should pass through")
+        XCTAssertEqual(loud, -12 - 8, accuracy: 0.3, "12 dB over the target should come down 8 dB")
         XCTAssertEqual(quiet, -36 + 8, accuracy: 0.3, "12 dB under the target should come up 8 dB")
     }
 
@@ -50,7 +50,8 @@ final class LevelerDSPTests: XCTestCase {
 
     func testStaticCurve() {
         var p = leveler_default_params()
-        XCTAssertEqual(leveler_static_gain_db(&p, -10), 0, accuracy: 0.01)
+        XCTAssertEqual(leveler_static_gain_db(&p, -12), -8, accuracy: 0.01)
+        XCTAssertEqual(leveler_static_gain_db(&p, 0), -p.max_cut_db, accuracy: 0.01)
         XCTAssertEqual(leveler_static_gain_db(&p, -24), 0, accuracy: 0.01)
         XCTAssertEqual(leveler_static_gain_db(&p, -30), 4, accuracy: 0.01)
         XCTAssertEqual(leveler_static_gain_db(&p, -48), p.max_boost_db, accuracy: 0.01)
@@ -80,6 +81,46 @@ final class LevelerDSPTests: XCTestCase {
         let onset = Int(rate) * 5
         let after = buf[(2 * (onset + Int(rate / 50)))..<(2 * n)].map(abs).max()!
         XCTAssertLessThanOrEqual(after, 0.7 + 1e-3)
+    }
+
+    func testPauseAfterQuietTalkerDoesNotRaiseNoise() {
+        let s = leveler_create()!
+        defer { leveler_destroy(s) }
+        leveler_init(s, leveler_default_params(), rate)
+        let n = Int(rate) * 6
+        var buf = [Float](repeating: 0, count: n * 2)
+        // 4 s of a quiet talker, then 2 s of noise at -70 dBFS.
+        let noise = powf(10, -70 / 20)
+        for i in 0..<n {
+            let v = i < Int(rate) * 4 ? 0.02 * sinf(2 * .pi * 220 * Float(i) / rate)
+                                      : noise * sinf(2 * .pi * 1000 * Float(i) / rate)
+            buf[2 * i] = v
+            buf[2 * i + 1] = v
+        }
+        buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, UInt32(n), 2) }
+        let tail = buf[(2 * (Int(rate) * 5))..<(2 * n)].map(abs).max()!
+        XCTAssertLessThanOrEqual(tail, noise * 1.01)
+    }
+
+    func testSoftenCutsTrebleOnlyForLoudTalkers() {
+        // A 6 kHz tone from a loud talker loses treble; from a talker at the
+        // target it doesn't.
+        func out(_ db: Float, soften: Float) -> Float {
+            var p = leveler_default_params()
+            p.soften_db = soften
+            let s = leveler_create()!
+            defer { leveler_destroy(s) }
+            leveler_init(s, p, rate)
+            let n = Int(rate) * 4
+            let amp = powf(10, db / 20)
+            var buf = [Float](repeating: 0, count: n * 2)
+            for i in 0..<n { let v = amp * sinf(2 * .pi * 6000 * Float(i) / rate); buf[2 * i] = v; buf[2 * i + 1] = v }
+            buf.withUnsafeMutableBufferPointer { leveler_process_interleaved(s, $0.baseAddress, $0.baseAddress, UInt32(n), 2) }
+            let tail = buf[n..<(2 * n)]
+            return 10 * log10f(tail.reduce(0) { $0 + $1 * $1 } / Float(tail.count))
+        }
+        XCTAssertLessThan(out(-3, soften: 6), out(-3, soften: 0) - 3)
+        XCTAssertEqual(out(-21, soften: 6), out(-21, soften: 0), accuracy: 0.05)
     }
 
     func testCeilingHolds() {

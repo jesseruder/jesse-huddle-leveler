@@ -6,11 +6,12 @@
 // Compressor settings. Levels are dBFS measured as a short-term RMS of the
 // louder channel, so ordinary speech sits somewhere around -35..-15 dBFS.
 typedef struct {
-    // Upward compression: voices quieter than boost_below_db are raised
-    // toward it; louder ones are left alone.
-    float boost_below_db;
-    float boost_ratio;   // 3 = a voice 12 dB under the target comes out 4 dB under
+    // Talker leveling: a slow gain moves each talker's speech level toward
+    // target_db, so quiet talkers are raised and loud ones turned down.
+    float target_db;
+    float level_ratio;   // 3 = a talker 12 dB off target ends up 4 dB off
     float max_boost_db;  // never raise anything by more than this
+    float max_cut_db;    // never turn anything down by more than this
     // Downward compression, off at ratio 1.
     float threshold_db;  // compression starts here
     float ratio;         // 4 = every 4 dB over the threshold comes out as 1 dB
@@ -20,6 +21,10 @@ typedef struct {
     float makeup_db;     // gain added back after compression
     float gate_db;       // below this, boost and makeup fade out so room noise isn't lifted
     float ceiling_db;    // peak limiter ceiling
+    // Treble cut above ~3 kHz for loud talkers, to soften the fizz of a mic
+    // that clips before the audio reaches us. Scales with how far the talker
+    // is being turned down: full at a cut of 8 dB or more. 0 turns it off.
+    float soften_db;
 } leveler_params;
 
 typedef struct leveler_state leveler_state;

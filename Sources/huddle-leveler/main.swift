@@ -19,13 +19,14 @@ what to tap:
   --output <text>     play to the output device whose name contains <text>
                       (default: the system default output, following changes)
 
-raising quiet voices (defaults in brackets; levels are short-term RMS dBFS):
-  --boost-below <dB>  voices quieter than this are raised toward it [-24]
-  --boost-ratio <n>   3 = a voice 12 dB under comes out 4 dB under [3]
-  --max-boost <dB>    most any voice is raised [12]
-  --gate <dB>         below this, boost fades out so noise isn't lifted [-55]
+leveling talkers (defaults in brackets; levels are speech RMS in dBFS):
+  --target <dB>       level every talker is moved toward [-24]
+  --level-ratio <n>   3 = a talker 12 dB off target ends up 4 dB off [3]
+  --max-boost <dB>    most a quiet talker is raised [12]
+  --max-cut <dB>      most a loud talker is turned down [15]
+  --gate <dB>         below this counts as silence; the gain holds [-55]
 
-taming loud voices (off by default):
+fast downward compression (off by default):
   --threshold <dB>    level where downward compression starts [-20]
   --ratio <n>         downward compression ratio; 1 = off [1]
   --knee <dB>         soft knee width [10]
@@ -35,6 +36,8 @@ taming loud voices (off by default):
   --release <ms>      [300]
 
   --ceiling <dB>      peak limiter ceiling [-0.5]
+  --soften <dB>       treble cut for loud talkers, to soften a clipping mic;
+                      0 = off [6]
 
 other:
   --list              list processes using audio and output devices, then exit
@@ -78,9 +81,10 @@ while !args.isEmpty {
         guard let p = pid_t(next(a)) else { fail("--pid needs a number") }
         pids.append(p)
     case "--output": outputMatch = next(a)
-    case "--boost-below": params.boost_below_db = number(a)
-    case "--boost-ratio": params.boost_ratio = max(1, number(a))
+    case "--target": params.target_db = number(a)
+    case "--level-ratio": params.level_ratio = max(1, number(a))
     case "--max-boost": params.max_boost_db = max(0, number(a))
+    case "--max-cut": params.max_cut_db = max(0, number(a))
     case "--threshold": params.threshold_db = number(a)
     case "--ratio": params.ratio = max(1, number(a))
     case "--knee": params.knee_db = max(0, number(a))
@@ -89,6 +93,7 @@ while !args.isEmpty {
     case "--makeup": params.makeup_db = number(a)
     case "--gate": params.gate_db = number(a)
     case "--ceiling": params.ceiling_db = min(0, number(a))
+    case "--soften": params.soften_db = max(0, number(a))
     case "--list": mode = "list"
     case "--curve": mode = "curve"
     case "--process-file": mode = "file"; fileArgs = [next(a), next(a)]
@@ -216,6 +221,8 @@ func reconcile() {
             return
         }
         try engine.start(processes: ids, output: output)
+        tapHeardAudio = false
+        silentTicks = 0
         let who = procs.map { "\($0.pid)" }.joined(separator: ",")
         status = "\(targetName) → \(output.name)"
         log("Tapping \(targetName) (\(procs.count) process\(procs.count == 1 ? "" : "es"): \(who)) → \(output.name) @ \(Int(engine.sampleRate)) Hz")
@@ -240,6 +247,7 @@ func meterBar(_ db: Float, width: Int = 20) -> String {
 
 var lastFrames: UInt64 = 0
 var silentTicks = 0
+var tapHeardAudio = false
 var meterTicks = 0
 var logPeakIn: Float = -120
 var logPeakOut: Float = -120
@@ -251,7 +259,10 @@ func drawMeter() {
     let outDB = 20 * log10(max(m.out_peak, 1e-6))
     // Warn once if the tap runs but delivers nothing but zeros for a while
     // while the app reports it is playing: that is what a missing permission looks like.
-    if m.frames != lastFrames && m.in_peak == 0 { silentTicks += 1 } else { silentTicks = 0 }
+    // Only a tap that has never delivered a sample counts: once audio has come
+    // through, silence is just a quiet huddle.
+    if m.in_peak > 0 { tapHeardAudio = true }
+    if !tapHeardAudio && m.frames != lastFrames { silentTicks += 1 } else { silentTicks = 0 }
     lastFrames = m.frames
     if silentTicks >= 100 {
         silentTicks = 0
@@ -275,8 +286,8 @@ func drawMeter() {
         logPeakOut = max(logPeakOut, outDB)
         if meterTicks % 20 == 0 {
             if logPeakIn > -100 {
-                print(String(format: "%@ in %.1f dB, gain %+.1f dB, out %.1f dB",
-                             engine.bypass ? "bypass" : "on", logPeakIn, m.gain_db, logPeakOut))
+                print(String(format: "%@ talker %.1f dB, gain %+.1f dB, peak in %.1f / out %.1f dB",
+                             engine.bypass ? "bypass" : "on", m.level_db, m.gain_db, logPeakIn, logPeakOut))
             }
             logPeakIn = -120
             logPeakOut = -120
@@ -289,6 +300,8 @@ func drawMeter() {
                       mode, meterBar(inDB), inDB, gain, meterBar(outDB), outDB)
     FileHandle.standardOutput.write(line.data(using: .utf8)!)
 }
+
+var keepAlive: [Any] = []
 
 func runLive() {
     let queue = DispatchQueue.main
@@ -337,7 +350,10 @@ func runLive() {
     timer.resume()
 
     reconcile()
-    withExtendedLifetime((listeners, signals, timer)) { dispatchMain() }
+    // A global keeps these alive; withExtendedLifetime around dispatchMain()
+    // doesn't survive optimization, which silently dropped the signal handlers.
+    keepAlive = [listeners, signals, timer]
+    dispatchMain()
 }
 
 do {

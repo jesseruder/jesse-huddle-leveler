@@ -23,24 +23,30 @@ System Audio Recording Only).
 
 ## Tuning
 
-    .build/release/huddle-leveler --curve                    # show what the settings do
-    .build/release/huddle-leveler --boost-below -20 --max-boost 15   # lift quiet voices more
-    .build/release/huddle-leveler --ratio 4 --threshold -20  # also pull loud voices down
+    .build/release/huddle-leveler --curve                 # show what the settings do
+    .build/release/huddle-leveler --target -20            # everyone louder overall
+    .build/release/huddle-leveler --level-ratio 5         # even talkers out harder
+    .build/release/huddle-leveler --soften 0              # no treble cut on loud talkers
     .build/release/huddle-leveler --process-file in.wav out.wav
 
-By default it only raises quiet voices; loud ones pass through untouched,
-because Slack's huddle audio already peaks near full scale and pulling it down
-is audible. It tracks the level of whoever is talking (only while someone is
-talking, so pauses don't ramp the gain up) and moves toward a new talker over a
-second or so. A talker quieter than -24 dBFS RMS is raised toward it at 3:1,
-by up to 12 dB. The boost never pushes a peak above -10 dBFS, so a loud talker
-starting right after a quiet one isn't boosted. Below the gate (-55 dBFS)
-nothing is raised.
+Fast compression of Slack's audio is audible (it already peaks near full
+scale), so by default huddle-leveler levels whole talkers with a slow gain
+instead. It tracks the speech level of whoever is talking, only while someone
+is talking so pauses hold the gain, following a louder talker within about
+100 ms and a quieter one over about 1.5 s. Each talker moves toward -24 dBFS
+RMS at 3:1 (a talker 12 dB off ends up 4 dB off), raised by up to 12 dB or
+turned down by up to 15 dB.
 
-On synthesized speech, a talker 19 dB under a loud one comes up 5-6 dB, and the
-loud one passes through unchanged.
+- A boost never pushes a peak above -10 dBFS, so a loud talker starting right
+  after a quiet one isn't boosted into the limiter.
+- Below the gate (-55 dBFS) boosts fade out, so room noise between words
+  isn't raised.
+- Loud talkers get a treble cut above ~3 kHz, up to 6 dB, scaled by how far
+  they're being turned down. When someone's mic clips before the audio
+  reaches Slack, nothing downstream can undo that; this softens the fizz.
+  The real fix is for them to lower their input level.
 
-Downward compression (`--ratio`, `--threshold`, `--makeup`, `--attack`,
+Fast downward compression (`--ratio`, `--threshold`, `--makeup`, `--attack`,
 `--release`) is still there but off by default.
 
 ## Notes
